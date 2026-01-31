@@ -271,12 +271,6 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ---
 
-## 📜 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
 ## ⚠️ Disclaimer
 
 This tool is intended for authorized security testing and research only. Always obtain proper authorization before testing systems you do not own.
