@@ -1,0 +1,4 @@
+# Core dependencies (none required - uses only stdlib)
+
+# Optional dependencies for enhanced functionality
+networkx>=2.6        # For attack path analysis (graph algorithms)
