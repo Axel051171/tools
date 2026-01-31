@@ -37,10 +37,6 @@ Extract, analyze, and report Active Directory security findings without needing 
 ## 📦 Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/Axel051171/tools.git
-cd tools/bh-findings-extractor
-
 # Optional: Install NetworkX for attack path analysis
 pip install networkx
 ```
