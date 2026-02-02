@@ -1,4 +1,4 @@
-# HASHSCAN v10.0
+# HASHSCAN v10.2
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20windows-blue)]()
@@ -7,17 +7,19 @@
 
 **Superman-Level Hash & Credential Scanner with Intelligence Features**
 
-A fast, lightweight, cross-platform tool for discovering password hashes, credentials, and secrets during penetration testing and security assessments.
+A fast, lightweight, cross-platform tool for discovering password hashes, credentials, and secrets during penetration testing and security assessments. **Now with direct Pcredz/Responder parsing!**
 
 ## Features
 
-- 🔐 **45+ Hash Patterns** - Unix crypt, bcrypt, Argon2, NetNTLM, Kerberos, etc.
+- 🔐 **50+ Hash Patterns** - Unix crypt, bcrypt, Argon2, NetNTLM, Kerberos, VNC, MySQL Native, etc.
 - 🔑 **70+ Credential Patterns** - ENV, YAML, JSON, XML, PHP, Python configs
 - ☁️ **25+ Cloud Token Patterns** - AWS, GitHub, Slack, OpenAI, Stripe, etc.
+- 🌐 **Network Auth Detection** - NetNTLMv1/v2, FTP, Telnet, SMTP, LDAP, SNMP, HTTP NTLM
 - 📦 **Archive Scanning** - Automatically extracts and scans ZIP/TAR/GZ
 - 🗄️ **SQLite Scanning** - Dumps databases or falls back to strings
 - 📜 **Git History** - Scans commit history for leaked secrets
 - 🧠 **Intelligence Features** - User correlation, reuse detection, hashcat generator
+- 🎯 **Pcredz Compatible** - Special handling for Pcredz/Responder output files
 - ⚡ **Fast & Lightweight** - 76KB binary, zero dependencies
 
 ## Quick Start
@@ -101,6 +103,9 @@ Options:
 Intelligence:
   --hashcat         Generate hashcat commands
   --no-correlation  Disable user-hash correlation
+
+Pcredz Integration:
+  --pcredz <file>   Parse Pcredz/Responder hashes.txt directly
 ```
 
 ## Intelligence Features
@@ -147,6 +152,48 @@ Detects when credentials appear multiple times:
   # [PIVOT] netntlmv2 found - Lateral Movement Options:
   # evil-winrm -i <target> -u <user> -H <hash>
   # psexec.py <domain>/<user>@<target> -hashes :<hash>
+```
+
+## Pcredz / Responder Compatibility
+
+HASHSCAN automatically detects and specially processes output from network credential capture tools:
+
+**Auto-detected files:**
+- `*hashes*`, `*credentials*`, `*pcredz*`, `*responder*`, `*ntlm*`, `*capture*`, `*loot*`
+
+**Network Auth patterns detected:**
+
+| Protocol | Pattern | Hashcat Mode |
+|----------|---------|--------------|
+| NetNTLMv1 | `user::domain:lm:nt:challenge` | 5500 |
+| NetNTLMv2 | `user::domain:challenge:proof:blob` | 5600 |
+| Kerberos TGS | `$krb5tgs$23$*user$realm$spn*$...` | 13100 |
+| Kerberos AS-REP | `$krb5asrep$23$user@REALM:...` | 18200 |
+| VNC | `$vnc$*challenge*response` | 10000 |
+| MySQL Native | `$mysqlna$challenge$response` | 11200 |
+| PostgreSQL SCRAM | `SCRAM-SHA-256$...` | 28600 |
+| HTTP NTLM | `Authorization: NTLM <base64>` | - |
+| FTP/Telnet/SMTP | Clear text captures | - |
+| SNMP | Community strings | - |
+
+**Direct Pcredz parsing (NEW in v10.2):**
+
+```bash
+# Direct parsing mode - fastest, optimized for Pcredz format
+./hashscan --pcredz hashes.txt --hashcat --json -o report.json
+
+# With full values
+./hashscan --pcredz /path/to/Pcredz-Session-hashes.txt --show-values
+```
+
+**Filesystem scanning (auto-detects Pcredz files):**
+
+```bash
+# Scan Responder logs directory
+./hashscan /usr/share/responder/logs/ --hashcat
+
+# Scan loot folder
+./hashscan ./loot/ --show-values
 ```
 
 ## Supported Patterns
@@ -274,6 +321,9 @@ Pull requests welcome! Please ensure your code:
 - Works on both Linux and Windows
 - Maintains zero external dependencies
 
+## License
+
+MIT License - see [LICENSE](LICENSE)
 
 ## Disclaimer
 

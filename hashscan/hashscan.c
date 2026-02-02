@@ -47,7 +47,7 @@
     #define IS_WINDOWS 0
 #endif
 
-#define VERSION "10.0"
+#define VERSION "10.2"
 #define MAX_LINE 16384
 #define MAX_PATH_LEN 4096
 #define MAX_CONTEXT 512
@@ -70,7 +70,7 @@ static int opt_collectors = 1;  /* Enable collectors by default */
  * DATA STRUCTURES
  * ============================================================================ */
 
-typedef enum { CAT_PASSWORD_HASH, CAT_POSSIBLE_HASH, CAT_PLAINTEXT, CAT_TOKEN, CAT_PRIVATE_KEY } Category;
+typedef enum { CAT_PASSWORD_HASH, CAT_POSSIBLE_HASH, CAT_PLAINTEXT, CAT_TOKEN, CAT_PRIVATE_KEY, CAT_NETWORK_AUTH } Category;
 typedef enum { CONF_HIGH, CONF_MEDIUM, CONF_LOW } Confidence;
 
 /* Forward declarations (after type definitions) */
@@ -153,6 +153,7 @@ static UserHashEntry* user_hash_table[USER_HASH_SIZE];
 static ReuseEntry* reuse_table[REUSE_HASH_SIZE];
 static int opt_hashcat_mode = 0;
 static int opt_correlation = 1;  /* Enable by default */
+static const char* opt_pcredz_file = NULL;  /* Pcredz direct parsing */
 
 /* ============================================================================
  * HASH PATTERNS
@@ -207,8 +208,18 @@ static const HashPattern PATTERNS[] = {
     {"cisco_type8", "$8$", 3, 55, 60, 9200, CONF_HIGH},
     {"cisco_type9", "$9$", 3, 55, 60, 9300, CONF_HIGH},
     /* Kerberos */
-    {"krb5tgs", "$krb5tgs$", 9, 50, 500, 13100, CONF_HIGH},
-    {"krb5asrep", "$krb5asrep$", 11, 50, 500, 18200, CONF_HIGH},
+    {"krb5tgs", "$krb5tgs$", 9, 50, 5000, 13100, CONF_HIGH},
+    {"krb5asrep", "$krb5asrep$", 11, 50, 5000, 18200, CONF_HIGH},
+    {"krb5pa", "$krb5pa$", 8, 50, 500, 7500, CONF_HIGH},
+    /* Network Auth - Pcredz compatible */
+    {"mysql_native", "$mysqlna$", 9, 40, 100, 11200, CONF_HIGH},
+    {"vnc_challenge", "$vnc$", 5, 40, 80, 10000, CONF_HIGH},
+    {"postgres_scram", "SCRAM-SHA-256$", 14, 80, 200, 28600, CONF_HIGH},
+    {"mssql_2012", "0x0200", 6, 50, 100, 1731, CONF_HIGH},
+    /* SNMP */
+    {"snmpv3", "$SNMPv3$", 8, 50, 300, 25000, CONF_HIGH},
+    /* RADIUS */
+    {"tacacs_plus", "$tacacs-plus$", 13, 30, 100, 16100, CONF_HIGH},
     {NULL, NULL, 0, 0, 0, 0, 0}
 };
 
@@ -1012,7 +1023,7 @@ static void add_finding(Category cat, const char* type, Confidence conf, const c
     }
     
     /* Track user-hash correlation */
-    if (cat == CAT_PASSWORD_HASH || cat == CAT_POSSIBLE_HASH) {
+    if (cat == CAT_PASSWORD_HASH || cat == CAT_POSSIBLE_HASH || cat == CAT_NETWORK_AUTH) {
         track_user_hash(f->owner, type, path);
     }
     
@@ -1023,7 +1034,7 @@ static void add_finding(Category cat, const char* type, Confidence conf, const c
     result.count++;
     
     if (opt_verbose) fprintf(stderr, "[+] %s: %s in %s:%d\n",
-        cat==CAT_PASSWORD_HASH?"HASH":cat==CAT_POSSIBLE_HASH?"POSSIBLE":"FOUND", type, path, line);
+        cat==CAT_PASSWORD_HASH?"HASH":cat==CAT_POSSIBLE_HASH?"POSSIBLE":cat==CAT_NETWORK_AUTH?"NETAUTH":"FOUND", type, path, line);
 }
 
 /* ============================================================================
@@ -1407,44 +1418,101 @@ static void scan_line(const char* line, const char* path, int lnum, long off, co
         aws_sec++;
     }
     
-    /* NetNTLMv2 (user::domain:challenge:response format) */
+    /* NetNTLMv1/v2 (user::domain:challenge:response format) - Pcredz compatible */
     const char* ntlm = line;
     while ((ntlm = strstr(ntlm, "::")) != NULL) {
         /* Look backwards for username */
         const char* user_start = ntlm;
-        while (user_start > line && *(user_start-1) != ' ' && *(user_start-1) != '\t' && *(user_start-1) != ':') user_start--;
-        if (ntlm - user_start >= 1) {
+        while (user_start > line && *(user_start-1) != ' ' && *(user_start-1) != '\t' && *(user_start-1) != ':' && *(user_start-1) != '\n') user_start--;
+        int user_len = ntlm - user_start;
+        if (user_len >= 1 && user_len <= 64) {
             /* Look forward for domain:challenge:response */
             const char* rest = ntlm + 2;
             int colons = 0;
             int rlen = 0;
-            while (rest[rlen] && rest[rlen] != ' ' && rest[rlen] != '\t' && rlen < 500) {
-                if (rest[rlen] == ':') colons++;
+            int challenge_start = -1, challenge_end = -1;
+            
+            while (rest[rlen] && rest[rlen] != ' ' && rest[rlen] != '\t' && rest[rlen] != '\n' && rlen < 600) {
+                if (rest[rlen] == ':') {
+                    colons++;
+                    if (colons == 2) challenge_start = rlen + 1;
+                    if (colons == 3) challenge_end = rlen;
+                }
                 rlen++;
             }
-            /* NetNTLMv2 has format: user::domain:challenge:NTProofStr:response */
-            if (colons >= 2 && rlen > 50) {
-                int total_len = (ntlm - user_start) + 2 + rlen;
-                if (total_len > 60 && total_len < 600) {
-                    char nv[600];
-                    strncpy(nv, user_start, total_len < 599 ? total_len : 599);
-                    nv[total_len < 599 ? total_len : 599] = '\0';
-                    /* Verify it looks like NetNTLM (has hex in response) */
-                    int hex_count = 0;
-                    for (int i = 0; i < rlen; i++) if (is_hex(rest[i])) hex_count++;
-                    if (hex_count > 30) {
-                        /* Determine v1 vs v2 by response length */
-                        /* v1: 48 hex chars, v2: much longer */
-                        if (hex_count >= 32 && hex_count <= 52) {
-                            add_finding(CAT_PASSWORD_HASH, "netntlmv1", CONF_HIGH, path, lnum, off, nv, 5500, "NetNTLMv1 capture", cb, ca);
-                        } else {
-                            add_finding(CAT_PASSWORD_HASH, "netntlmv2", CONF_HIGH, path, lnum, off, nv, 5600, "NetNTLMv2 capture", cb, ca);
+            
+            /* Validate: NetNTLMv1: user::domain:challenge:lm:nt (colons=4, challenge=16 hex) */
+            /* Validate: NetNTLMv2: user::domain:challenge:ntproof:blob (colons>=3, longer) */
+            if (colons >= 3 && rlen > 50) {
+                /* Check if challenge is 16 hex chars (8 bytes) */
+                int valid_challenge = 0;
+                if (challenge_start > 0 && challenge_end > challenge_start) {
+                    int clen = challenge_end - challenge_start;
+                    if (clen == 16) {
+                        valid_challenge = 1;
+                        for (int i = challenge_start; i < challenge_end && valid_challenge; i++) {
+                            if (!is_hex(rest[i])) valid_challenge = 0;
+                        }
+                    }
+                }
+                
+                if (valid_challenge || colons >= 4) {
+                    int total_len = user_len + 2 + rlen;
+                    if (total_len > 50 && total_len < 700) {
+                        char nv[700];
+                        strncpy(nv, user_start, total_len < 699 ? total_len : 699);
+                        nv[total_len < 699 ? total_len : 699] = '\0';
+                        
+                        /* Count hex chars in response portion */
+                        int hex_count = 0;
+                        for (int i = 0; i < rlen; i++) if (is_hex(rest[i])) hex_count++;
+                        
+                        if (hex_count > 30) {
+                            /* Determine v1 vs v2 by structure */
+                            /* v1: colons=4, response ~48 hex */
+                            /* v2: colons=3+, response much longer (ntproof=32 + blob) */
+                            char* username = malloc(user_len + 1);
+                            if (username) {
+                                strncpy(username, user_start, user_len);
+                                username[user_len] = '\0';
+                                track_user_hash(username, colons == 4 ? "netntlmv1" : "netntlmv2", path);
+                                free(username);
+                            }
+                            
+                            if (colons == 4 && hex_count < 100) {
+                                add_finding(CAT_NETWORK_AUTH, "netntlmv1", CONF_HIGH, path, lnum, off, nv, 5500, "NetNTLMv1 capture (Pcredz/Responder)", cb, ca);
+                            } else {
+                                add_finding(CAT_NETWORK_AUTH, "netntlmv2", CONF_HIGH, path, lnum, off, nv, 5600, "NetNTLMv2 capture (Pcredz/Responder)", cb, ca);
+                            }
                         }
                     }
                 }
             }
         }
         ntlm++;
+    }
+    
+    /* HTTP NTLM (Type 3 message in Authorization header) */
+    const char* http_ntlm = strcasestr_local(line, "Authorization: NTLM ");
+    if (http_ntlm) {
+        const char* b64 = http_ntlm + 20;
+        while (*b64 == ' ') b64++;
+        int b64len = 0;
+        while (b64[b64len] && (isalnum(b64[b64len]) || b64[b64len] == '+' || b64[b64len] == '/' || b64[b64len] == '=')) b64len++;
+        if (b64len >= 50 && b64len <= 2000) {
+            char token[2048];
+            strncpy(token, b64, b64len < 2047 ? b64len : 2047);
+            token[b64len < 2047 ? b64len : 2047] = '\0';
+            add_finding(CAT_NETWORK_AUTH, "http_ntlm", CONF_HIGH, path, lnum, off, token, -1, "HTTP NTLM Auth (Type 3)", cb, ca);
+        }
+    }
+    
+    /* SMB/CIFS credential patterns */
+    if (strcasestr_local(line, "\\\\") && (strcasestr_local(line, "pass") || strcasestr_local(line, "pwd"))) {
+        /* Check for net use or SMB credential line */
+        if (strcasestr_local(line, "net use") || strcasestr_local(line, "/user:")) {
+            add_finding(CAT_NETWORK_AUTH, "smb_credential", CONF_MEDIUM, path, lnum, off, "[SMB credential line]", -1, "SMB/CIFS credential reference", cb, ca);
+        }
     }
     
     /* Base64 encoded secrets (look for base64 after secret keywords) */
@@ -1614,6 +1682,92 @@ static int should_skip(const char* dn) {
     return 0;
 }
 
+/* Pcredz/Responder output file detection */
+static int is_pcredz_output(const char* path) {
+    const char* fname = strrchr(path, '/');
+    if (!fname) fname = strrchr(path, '\\');
+    fname = fname ? fname + 1 : path;
+    
+    /* Common Pcredz/Responder output patterns */
+    if (strcasestr_local(fname, "hashes") ||
+        strcasestr_local(fname, "credentials") ||
+        strcasestr_local(fname, "pcredz") ||
+        strcasestr_local(fname, "responder") ||
+        strcasestr_local(fname, "ntlm") ||
+        strcasestr_local(fname, "capture") ||
+        strcasestr_local(fname, "loot")) {
+        return 1;
+    }
+    return 0;
+}
+
+/* Special scanner for Pcredz-style output files */
+static void scan_pcredz_line(const char* line, const char* path, int lnum) {
+    /* FTP credentials: FTP User:pass@host */
+    if (strncasecmp(line, "FTP", 3) == 0 || strcasestr_local(line, "ftp://")) {
+        const char* at = strchr(line, '@');
+        const char* colon = strchr(line, ':');
+        if (at && colon && colon < at) {
+            add_finding(CAT_NETWORK_AUTH, "ftp_credential", CONF_HIGH, path, lnum, 0, 
+                       line, -1, "FTP credential (Pcredz)", NULL, NULL);
+        }
+    }
+    
+    /* Telnet credentials */
+    if (strncasecmp(line, "Telnet", 6) == 0) {
+        add_finding(CAT_NETWORK_AUTH, "telnet_credential", CONF_HIGH, path, lnum, 0,
+                   line, -1, "Telnet credential (Pcredz)", NULL, NULL);
+    }
+    
+    /* HTTP Basic */
+    if (strcasestr_local(line, "HTTP") && strcasestr_local(line, "Basic")) {
+        add_finding(CAT_NETWORK_AUTH, "http_basic", CONF_HIGH, path, lnum, 0,
+                   line, -1, "HTTP Basic Auth (Pcredz)", NULL, NULL);
+    }
+    
+    /* SMTP credentials */
+    if (strncasecmp(line, "SMTP", 4) == 0 || strcasestr_local(line, "smtp://")) {
+        add_finding(CAT_NETWORK_AUTH, "smtp_credential", CONF_HIGH, path, lnum, 0,
+                   line, -1, "SMTP credential (Pcredz)", NULL, NULL);
+    }
+    
+    /* POP3 credentials */
+    if (strncasecmp(line, "POP3", 4) == 0 || strcasestr_local(line, "pop3://")) {
+        add_finding(CAT_NETWORK_AUTH, "pop3_credential", CONF_HIGH, path, lnum, 0,
+                   line, -1, "POP3 credential (Pcredz)", NULL, NULL);
+    }
+    
+    /* IMAP credentials */
+    if (strncasecmp(line, "IMAP", 4) == 0 || strcasestr_local(line, "imap://")) {
+        add_finding(CAT_NETWORK_AUTH, "imap_credential", CONF_HIGH, path, lnum, 0,
+                   line, -1, "IMAP credential (Pcredz)", NULL, NULL);
+    }
+    
+    /* LDAP credentials */
+    if (strncasecmp(line, "LDAP", 4) == 0 || strcasestr_local(line, "ldap://")) {
+        add_finding(CAT_NETWORK_AUTH, "ldap_credential", CONF_HIGH, path, lnum, 0,
+                   line, -1, "LDAP credential (Pcredz)", NULL, NULL);
+    }
+    
+    /* SNMPv1/v2 community strings */
+    if (strcasestr_local(line, "SNMP") && strcasestr_local(line, "community")) {
+        add_finding(CAT_NETWORK_AUTH, "snmp_community", CONF_HIGH, path, lnum, 0,
+                   line, -1, "SNMP community string", NULL, NULL);
+    }
+    
+    /* Kerberos (raw format) */
+    if (strcasestr_local(line, "Kerberos") || strcasestr_local(line, "TGS") || strcasestr_local(line, "AS-REP")) {
+        add_finding(CAT_NETWORK_AUTH, "kerberos_ticket", CONF_HIGH, path, lnum, 0,
+                   line, -1, "Kerberos ticket data (Pcredz)", NULL, NULL);
+    }
+    
+    /* WPA/WPA2 handshake reference */
+    if (strcasestr_local(line, "WPA") || strcasestr_local(line, "PMKID") || strcasestr_local(line, "EAPOL")) {
+        add_finding(CAT_NETWORK_AUTH, "wifi_handshake", CONF_HIGH, path, lnum, 0,
+                   line, -1, "WiFi handshake/PMKID reference", NULL, NULL);
+    }
+}
+
 static void scan_file(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) { result.errors++; return; }
@@ -1644,6 +1798,9 @@ static void scan_file(const char* path) {
     }
     
     result.files_scanned++;
+    
+    /* Check if this is a Pcredz/Responder output file for special handling */
+    int pcredz_mode = is_pcredz_output(path);
     
     for (int i = 0; i < 5; i++) { if (!line_buffer[i]) line_buffer[i] = malloc(MAX_LINE); if (line_buffer[i]) line_buffer[i][0]='\0'; }
     
@@ -1679,6 +1836,11 @@ static void scan_file(const char* path) {
         }
         
         scan_line(ln, path, lnum, boff, opt_context_lines ? ctx_b : NULL, opt_context_lines ? ctx_a : NULL);
+        
+        /* Additional Pcredz-specific scanning for network capture files */
+        if (pcredz_mode) {
+            scan_pcredz_line(ln, path, lnum);
+        }
         
         boff += (le - ls);
         while (le < content + clen && (*le == '\n' || *le == '\r')) { boff++; le++; }
@@ -1801,7 +1963,7 @@ static void collect_shadow(void) {
 static const char* cat_str(Category c) {
     switch (c) { case CAT_PASSWORD_HASH: return "PASSWORD_HASH"; case CAT_POSSIBLE_HASH: return "POSSIBLE_HASH";
                  case CAT_PLAINTEXT: return "PLAINTEXT"; case CAT_TOKEN: return "TOKEN";
-                 case CAT_PRIVATE_KEY: return "PRIVATE_KEY"; default: return "UNKNOWN"; }
+                 case CAT_PRIVATE_KEY: return "PRIVATE_KEY"; case CAT_NETWORK_AUTH: return "NETWORK_AUTH"; default: return "UNKNOWN"; }
 }
 
 static const char* conf_str(Confidence c) {
@@ -2037,6 +2199,196 @@ static void banner(void) {
     fprintf(stderr, "════════════════════════════════════════════════════════════════════\n\n");
 }
 
+/* ============================================================================
+ * PCREDZ DIRECT PARSER - Parse Pcredz/Responder output files
+ * ============================================================================ */
+
+static void parse_pcredz_file(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "[!] Cannot open Pcredz file: %s\n", path);
+        return;
+    }
+    
+    fprintf(stderr, "[*] Parsing Pcredz file: %s\n", path);
+    
+    char line[MAX_LINE];
+    int lnum = 0;
+    int found = 0;
+    
+    while (fgets(line, sizeof(line), f)) {
+        lnum++;
+        
+        /* Remove trailing newline */
+        int len = strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) {
+            line[--len] = '\0';
+        }
+        
+        if (len < 5) continue;
+        
+        /* Skip comments but check for PLAINTEXT markers */
+        if (line[0] == '#') {
+            /* Pcredz plaintext format: # PLAINTEXT [protocol] user:pass */
+            if (strstr(line, "PLAINTEXT")) {
+                const char* proto_start = strchr(line, '[');
+                const char* proto_end = proto_start ? strchr(proto_start, ']') : NULL;
+                if (proto_start && proto_end) {
+                    char proto[32] = {0};
+                    int plen = proto_end - proto_start - 1;
+                    if (plen > 0 && plen < 31) {
+                        strncpy(proto, proto_start + 1, plen);
+                    }
+                    const char* cred = proto_end + 1;
+                    while (*cred == ' ') cred++;
+                    if (strlen(cred) > 3) {
+                        char reason[128];
+                        snprintf(reason, sizeof(reason), "Pcredz PLAINTEXT [%s]", proto);
+                        add_finding(CAT_NETWORK_AUTH, "pcredz_plaintext", CONF_HIGH, path, lnum, 0,
+                                   cred, -1, reason, NULL, NULL);
+                        found++;
+                    }
+                }
+            }
+            continue;
+        }
+        
+        /* NetNTLMv1: user::domain:lmhash:nthash:challenge (5 colons total) */
+        /* NetNTLMv2: user::domain:challenge:ntproof:blob */
+        if (strstr(line, "::")) {
+            int colons = 0;
+            for (int i = 0; line[i]; i++) if (line[i] == ':') colons++;
+            
+            if (colons >= 4) {
+                /* Extract username for tracking */
+                char* dcolon = strstr(line, "::");
+                if (dcolon) {
+                    char user[64] = {0};
+                    int ulen = dcolon - line;
+                    if (ulen > 0 && ulen < 63) {
+                        strncpy(user, line, ulen);
+                        track_user_hash(user, colons == 5 ? "netntlmv1" : "netntlmv2", path);
+                    }
+                }
+                
+                /* Determine v1 vs v2 by colon count and structure */
+                if (colons == 5) {
+                    add_finding(CAT_NETWORK_AUTH, "netntlmv1", CONF_HIGH, path, lnum, 0,
+                               line, 5500, "Pcredz NetNTLMv1", NULL, NULL);
+                } else {
+                    add_finding(CAT_NETWORK_AUTH, "netntlmv2", CONF_HIGH, path, lnum, 0,
+                               line, 5600, "Pcredz NetNTLMv2", NULL, NULL);
+                }
+                found++;
+                continue;
+            }
+        }
+        
+        /* Kerberos AS-REP: $krb5asrep$23$user@REALM:... */
+        if (strncmp(line, "$krb5asrep$", 11) == 0) {
+            add_finding(CAT_PASSWORD_HASH, "krb5asrep", CONF_HIGH, path, lnum, 0,
+                       line, 18200, "Pcredz Kerberos AS-REP", NULL, NULL);
+            found++;
+            continue;
+        }
+        
+        /* Kerberos TGS: $krb5tgs$23$*user$realm$spn*$... */
+        if (strncmp(line, "$krb5tgs$", 9) == 0) {
+            add_finding(CAT_PASSWORD_HASH, "krb5tgs", CONF_HIGH, path, lnum, 0,
+                       line, 13100, "Pcredz Kerberos TGS", NULL, NULL);
+            found++;
+            continue;
+        }
+        
+        /* MySQL Native: $mysqlna$challenge$response */
+        if (strncmp(line, "$mysqlna$", 9) == 0) {
+            add_finding(CAT_PASSWORD_HASH, "mysql_native", CONF_HIGH, path, lnum, 0,
+                       line, 11200, "Pcredz MySQL Native Auth", NULL, NULL);
+            found++;
+            continue;
+        }
+        
+        /* PostgreSQL MD5: md5 + 32hex */
+        if (strncmp(line, "md5", 3) == 0 && len >= 35) {
+            int is_md5 = 1;
+            for (int i = 3; i < 35 && is_md5; i++) {
+                if (!is_hex(line[i])) is_md5 = 0;
+            }
+            if (is_md5) {
+                add_finding(CAT_PASSWORD_HASH, "postgres_md5", CONF_HIGH, path, lnum, 0,
+                           line, 0, "Pcredz PostgreSQL MD5", NULL, NULL);
+                found++;
+                continue;
+            }
+        }
+        
+        /* VNC: $vnc$*challenge*response */
+        if (strncmp(line, "$vnc$", 5) == 0) {
+            add_finding(CAT_PASSWORD_HASH, "vnc_challenge", CONF_HIGH, path, lnum, 0,
+                       line, 10000, "Pcredz VNC Challenge", NULL, NULL);
+            found++;
+            continue;
+        }
+        
+        /* SNMPv3: $SNMPv3$... */
+        if (strncmp(line, "$SNMPv3$", 8) == 0) {
+            add_finding(CAT_NETWORK_AUTH, "snmpv3", CONF_HIGH, path, lnum, 0,
+                       line, 25000, "Pcredz SNMPv3", NULL, NULL);
+            found++;
+            continue;
+        }
+        
+        /* MSSQL: 0x0100... or 0x0200... */
+        if (strncmp(line, "0x0100", 6) == 0 || strncmp(line, "0x0200", 6) == 0) {
+            int mode = (line[4] == '1') ? 132 : 1731;
+            const char* type = (line[4] == '1') ? "mssql_2005" : "mssql_2012";
+            add_finding(CAT_PASSWORD_HASH, type, CONF_HIGH, path, lnum, 0,
+                       line, mode, "Pcredz MSSQL", NULL, NULL);
+            found++;
+            continue;
+        }
+        
+        /* HTTP Basic: base64 after "Basic " */
+        if (strcasestr_local(line, "Basic ")) {
+            const char* b64 = strcasestr_local(line, "Basic ") + 6;
+            while (*b64 == ' ') b64++;
+            if (strlen(b64) > 4) {
+                add_finding(CAT_NETWORK_AUTH, "http_basic", CONF_HIGH, path, lnum, 0,
+                           b64, -1, "Pcredz HTTP Basic Auth", NULL, NULL);
+                found++;
+            }
+            continue;
+        }
+        
+        /* NTLM SSP (raw hex capture) */
+        if (strcasestr_local(line, "NTLMSSP") || strcasestr_local(line, "NTLMv")) {
+            add_finding(CAT_NETWORK_AUTH, "ntlm_ssp", CONF_HIGH, path, lnum, 0,
+                       line, -1, "Pcredz NTLM SSP", NULL, NULL);
+            found++;
+            continue;
+        }
+        
+        /* Generic protocol:user:pass or user:pass@host format */
+        if (strchr(line, ':') && strchr(line, '@')) {
+            /* FTP, SMTP, POP3, IMAP, etc. */
+            const char* protocols[] = {"ftp", "smtp", "pop3", "imap", "telnet", "ldap", "http", "https", NULL};
+            for (int i = 0; protocols[i]; i++) {
+                if (strncasecmp(line, protocols[i], strlen(protocols[i])) == 0) {
+                    char reason[64];
+                    snprintf(reason, sizeof(reason), "Pcredz %s credential", protocols[i]);
+                    add_finding(CAT_NETWORK_AUTH, "protocol_credential", CONF_HIGH, path, lnum, 0,
+                               line, -1, reason, NULL, NULL);
+                    found++;
+                    break;
+                }
+            }
+        }
+    }
+    
+    fclose(f);
+    fprintf(stderr, "[+] Pcredz parsing complete: %d findings\n\n", found);
+}
+
 static void usage(const char* p) {
     printf("Usage: %s [options] [paths...]\n\n", p);
     printf("Options:\n");
@@ -2053,6 +2405,8 @@ static void usage(const char* p) {
     printf("\nIntelligence:\n");
     printf("  --hashcat         Generate hashcat commands\n");
     printf("  --no-correlation  Disable user-hash correlation\n");
+    printf("\nPcredz Integration:\n");
+    printf("  --pcredz <file>   Parse Pcredz/Responder hashes.txt directly\n");
     printf("\nCollectors (auto-detected tools):\n");
     printf("  - Archive: unzip, tar (extracts ZIP/TAR/GZ/BZ2)\n");
     printf("  - SQLite:  sqlite3 or strings fallback\n");
@@ -2083,6 +2437,7 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i],"--no-collectors")==0) opt_collectors=0;
         else if (strcmp(argv[i],"--hashcat")==0) opt_hashcat_mode=1;
         else if (strcmp(argv[i],"--no-correlation")==0) opt_correlation=0;
+        else if (strcmp(argv[i],"--pcredz")==0&&i+1<argc) opt_pcredz_file=argv[++i];
         else if (strcmp(argv[i],"--profile")==0&&i+1<argc) profile=argv[++i];
         else if (strcmp(argv[i],"-o")==0&&i+1<argc) outfile=argv[++i];
         else if (strcmp(argv[i],"--max-files")==0&&i+1<argc) opt_max_files=atoi(argv[++i]);
@@ -2108,14 +2463,38 @@ int main(int argc, char* argv[]) {
     
     fprintf(stderr, "[*] Mode: %s | Context: %d | Max: %d files\n", opt_wide?"wide":"strict", opt_context_lines, opt_max_files);
     if (profile) fprintf(stderr, "[*] Profile: %s\n", profile);
+    if (opt_pcredz_file) fprintf(stderr, "[*] Pcredz mode: %s\n", opt_pcredz_file);
     fprintf(stderr, "\n");
+    
+    /* Pcredz direct parsing mode - skip normal scanning */
+    if (opt_pcredz_file) {
+        parse_pcredz_file(opt_pcredz_file);
+        if (opt_json) print_json(); else print_report();
+        if (json_file) { fclose(json_file); fprintf(stderr, "\n[+] Saved: %s\n", outfile); }
+        free(result.findings);
+        free_tables();
+        for (int i = 0; i < 5; i++) if (line_buffer[i]) free(line_buffer[i]);
+        return 0;
+    }
     
     if (profile) run_profile(profile);
     else if (pathc > 0) {
 #ifndef _WIN32
         collect_shadow();
 #endif
-        for (int i = 0; i < pathc; i++) { fprintf(stderr, "[*] %s\n", paths[i]); scan_dir(paths[i], 0); }
+        for (int i = 0; i < pathc; i++) {
+            struct stat st;
+            if (stat(paths[i], &st) == 0) {
+                fprintf(stderr, "[*] %s\n", paths[i]);
+                if (S_ISDIR(st.st_mode)) {
+                    scan_dir(paths[i], 0);
+                } else if (S_ISREG(st.st_mode)) {
+                    scan_file(paths[i]);
+                }
+            } else {
+                fprintf(stderr, "[!] Cannot access: %s\n", paths[i]);
+            }
+        }
     } else {
 #ifndef _WIN32
         collect_shadow();

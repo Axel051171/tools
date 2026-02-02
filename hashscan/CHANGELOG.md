@@ -2,6 +2,43 @@
 
 All notable changes to HASHSCAN are documented here.
 
+## [10.2] - 2025-02-02
+
+### Added
+- **`--pcredz <file>` Parameter** - Direct parsing of Pcredz/Responder output files
+- Dedicated Pcredz parser with optimized format recognition
+- Support for Pcredz PLAINTEXT markers (`# PLAINTEXT [protocol] user:pass`)
+- Protocol credential detection (FTP, SMTP, POP3, IMAP, Telnet, LDAP, HTTP)
+- HTTP Basic Auth extraction from Pcredz output
+- NTLM SSP detection
+
+### Changed
+- Pcredz mode skips filesystem scanning for faster processing
+- Improved NetNTLMv1 vs v2 detection by colon count heuristic
+
+## [10.1] - 2025-02-02
+
+### Added
+- **Pcredz/Responder Compatibility** - Auto-detects network capture output files
+- **NETWORK_AUTH Category** - Dedicated category for network authentication captures
+- **Network Auth Patterns:**
+  - MySQL Native Auth (`$mysqlna$`) - hashcat mode 11200
+  - VNC Challenge (`$vnc$`) - hashcat mode 10000
+  - PostgreSQL SCRAM (`SCRAM-SHA-256$`) - hashcat mode 28600
+  - SNMPv3 (`$SNMPv3$`) - hashcat mode 25000
+  - TACACS+ (`$tacacs-plus$`) - hashcat mode 16100
+  - HTTP NTLM (Base64 Type 3 messages)
+  - FTP/Telnet/SMTP/POP3/IMAP/LDAP clear text credentials
+  - SNMP community strings
+  - WiFi handshake/PMKID references
+- **Direct File Scanning** - Can now scan individual files (not just directories)
+- **Improved NetNTLMv1/v2 Detection** - Better parsing with challenge validation
+
+### Changed
+- Kerberos patterns now support longer tickets (up to 5000 chars)
+- NetNTLM detection moved to CAT_NETWORK_AUTH category
+- Binary size: 76 KB (Linux), 312 KB (Windows)
+
 ## [10.0] - 2025-02-01
 
 ### Added
