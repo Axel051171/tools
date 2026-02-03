@@ -37,9 +37,15 @@
     #define PATH_SEP '\\'
     #define IS_WINDOWS 1
     #define stat _stat
-    #define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
-    #define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
-    #define S_ISLNK(m) 0
+    #ifndef S_ISDIR
+        #define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+    #endif
+    #ifndef S_ISREG
+        #define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+    #endif
+    #ifndef S_ISLNK
+        #define S_ISLNK(m) 0
+    #endif
 #else
     #include <unistd.h>
     #include <pwd.h>
