@@ -1,24 +1,32 @@
 /*
- * HASHSCAN v6.0 - Superman Hash Artifact Scanner
- * ================================================
- * Cross-platform (Linux/Windows) comprehensive hash finder.
- * 
+ * HASHSCAN v11.0 - Superman Hash Artifact Scanner
+ * =================================================
+ * Cross-platform (Linux/Windows) comprehensive hash & credential finder.
+ *
  * Features:
- *   - Binary detection (skips binaries)
- *   - UTF-16 detection & conversion
- *   - Deduplication (FNV-1a fingerprint)
- *   - Context lines
- *   - Proper JSON escaping
- *   - Windows owner via path heuristic
- *   - 45+ hash patterns
- *   - Smart hex false-positive filtering
- *   - Symlink loop detection (inode tracking)
- *   - Dynamic memory (no fixed limits)
- *   - Timeout support
+ *   - 60+ hash patterns (Unix crypt, bcrypt, Argon2, NetNTLM, Kerberos, ...)
+ *   - 70+ credential patterns (ENV, YAML, JSON, XML, PHP, Python, ...)
+ *   - 25+ cloud token patterns (AWS, GitHub, Slack, OpenAI, Stripe, ...)
+ *   - Pwdump/hashdump format (user:RID:LM:NT:::)
+ *   - GPP cpassword extraction
+ *   - BitLocker recovery key detection
+ *   - WPA PMKID hashcat format
+ *   - User registry from /etc/passwd with credential correlation
+ *   - Shell/SQL history scanning for passwords in commands
+ *   - WiFi PSK extraction (NetworkManager + Windows profiles)
+ *   - /proc/*/environ secret scanning
+ *   - Crontab credential scanning
+ *   - htpasswd user:hash inline parsing
+ *   - Windows: Unattend.xml, GPP, PowerShell history, WiFi, DPAPI
+ *   - Windows: SAM/SYSTEM/NTDS.dit artifact detection
+ *   - KeePass .kdbx / RDP password detection
+ *   - Archive/SQLite/Git collectors
+ *   - Binary/UTF-16 detection, dedup, context lines, JSON output
+ *   - Symlink loop detection, dynamic memory, timeout support
  *
  * Compile:
- *   Linux:   gcc -O2 -o hashscan hashscan.c
- *   Windows: x86_64-w64-mingw32-gcc -O2 -o hashscan.exe hashscan.c
+ *   Linux:   gcc -O2 -o hashscan hashscan.c -lm
+ *   Windows: x86_64-w64-mingw32-gcc -O2 -o hashscan.exe hashscan.c -lm
  */
 
 #include <stdio.h>
@@ -31,6 +39,7 @@
 #include <dirent.h>
 #include <math.h>
 #include <errno.h>
+#include <signal.h>
 
 #ifdef _WIN32
     #include <windows.h>
@@ -53,7 +62,7 @@
     #define IS_WINDOWS 0
 #endif
 
-#define VERSION "10.2"
+#define VERSION "11.0"
 #define MAX_LINE 16384
 #define MAX_PATH_LEN 4096
 #define MAX_CONTEXT 512
@@ -122,7 +131,7 @@ typedef struct InodeEntry { uint64_t inode; uint64_t dev; struct InodeEntry* nex
 static ScanResult result;
 static DedupeEntry* dedup_table[HASH_TABLE_SIZE];
 static InodeEntry* inode_table[HASH_TABLE_SIZE];
-static int opt_wide = 0, opt_show_values = 0, opt_json = 0, opt_verbose = 0, opt_context_lines = 1;
+static int opt_wide = 0, opt_show_values = 0, opt_json = 0, opt_verbose = 0, opt_quiet = 0, opt_context_lines = 1;
 static int opt_max_files = 50000, opt_max_runtime = 0;
 static long opt_max_file_size = 20 * 1024 * 1024;
 static FILE* json_file = NULL;
@@ -160,6 +169,60 @@ static ReuseEntry* reuse_table[REUSE_HASH_SIZE];
 static int opt_hashcat_mode = 0;
 static int opt_correlation = 1;  /* Enable by default */
 static const char* opt_pcredz_file = NULL;  /* Pcredz direct parsing */
+
+/* ============================================================================
+ * USER REGISTRY - Track known system users
+ * ============================================================================ */
+
+#define USER_REGISTRY_SIZE 512
+
+typedef struct UserRegEntry {
+    char username[64];
+    int uid;
+    char home_dir[MAX_PATH_LEN];
+    char shell[128];
+    int has_password;       /* 1 if found in shadow with real hash */
+    int credential_count;   /* number of credentials found for this user */
+    struct UserRegEntry* next;
+} UserRegEntry;
+
+static UserRegEntry* user_registry[USER_REGISTRY_SIZE];
+
+static void user_registry_add(const char* username, int uid, const char* home, const char* shell) {
+    if (!username || !username[0]) return;
+    uint32_t h = 2166136261u;
+    for (const char* p = username; *p; p++) { h ^= (unsigned char)*p; h *= 16777619u; }
+    int idx = h % USER_REGISTRY_SIZE;
+    /* Check if already exists */
+    for (UserRegEntry* e = user_registry[idx]; e; e = e->next)
+        if (strcmp(e->username, username) == 0) return;
+    UserRegEntry* e = calloc(1, sizeof(UserRegEntry));
+    if (!e) return;
+    strncpy(e->username, username, sizeof(e->username) - 1);
+    e->uid = uid;
+    if (home) strncpy(e->home_dir, home, sizeof(e->home_dir) - 1);
+    if (shell) strncpy(e->shell, shell, sizeof(e->shell) - 1);
+    e->next = user_registry[idx];
+    user_registry[idx] = e;
+}
+
+static UserRegEntry* user_registry_find(const char* username) {
+    if (!username || !username[0]) return NULL;
+    uint32_t h = 2166136261u;
+    for (const char* p = username; *p; p++) { h ^= (unsigned char)*p; h *= 16777619u; }
+    int idx = h % USER_REGISTRY_SIZE;
+    for (UserRegEntry* e = user_registry[idx]; e; e = e->next)
+        if (strcmp(e->username, username) == 0) return e;
+    return NULL;
+}
+
+static void user_registry_free(void) {
+    for (int i = 0; i < USER_REGISTRY_SIZE; i++) {
+        UserRegEntry* e = user_registry[i];
+        while (e) { UserRegEntry* n = e->next; free(e); e = n; }
+        user_registry[i] = NULL;
+    }
+}
 
 /* ============================================================================
  * HASH PATTERNS
@@ -204,9 +267,9 @@ static const HashPattern PATTERNS[] = {
     /* Database */
     {"postgres_md5", "md5", 3, 35, 35, 0, CONF_HIGH},
     {"mssql2005", "0x0100", 6, 54, 54, 132, CONF_HIGH},
-    {"mssql2012", "0x0200", 6, 132, 140, 1731, CONF_HIGH},
+    {"mssql2012", "0x0200", 6, 50, 140, 1731, CONF_HIGH},
     /* SCRAM */
-    {"scram_sha256", "SCRAM-SHA-256$", 14, 80, 200, -1, CONF_HIGH},
+    {"scram_sha256", "SCRAM-SHA-256$", 14, 80, 200, 28600, CONF_HIGH},
     {"mongodb_scram", "SCRAM-SHA-1$", 12, 70, 150, -1, CONF_HIGH},
     /* Windows */
     {"dcc2", "$DCC2$", 6, 50, 100, 2100, CONF_HIGH},
@@ -220,8 +283,7 @@ static const HashPattern PATTERNS[] = {
     /* Network Auth - Pcredz compatible */
     {"mysql_native", "$mysqlna$", 9, 40, 100, 11200, CONF_HIGH},
     {"vnc_challenge", "$vnc$", 5, 40, 80, 10000, CONF_HIGH},
-    {"postgres_scram", "SCRAM-SHA-256$", 14, 80, 200, 28600, CONF_HIGH},
-    {"mssql_2012", "0x0200", 6, 50, 100, 1731, CONF_HIGH},
+    /* postgres_scram and mssql_2012 merged into scram_sha256 and mssql2012 above */
     /* SNMP */
     {"snmpv3", "$SNMPv3$", 8, 50, 300, 25000, CONF_HIGH},
     /* RADIUS */
@@ -403,6 +465,38 @@ static const char* SQL_PASSWORD_COLUMNS[] = {
  * UTILITIES
  * ============================================================================ */
 
+/* Sanitize a path for safe use in shell commands.
+ * Escapes single quotes by replacing ' with '\'' */
+static void shell_escape(const char* src, char* dst, size_t dsz) {
+    size_t di = 0;
+    dst[0] = '\0';
+    for (size_t si = 0; src[si] && di < dsz - 5; si++) {
+        if (src[si] == '\'') {
+            dst[di++] = '\'';
+            dst[di++] = '\\';
+            dst[di++] = '\'';
+            dst[di++] = '\'';
+        } else {
+            dst[di++] = src[si];
+        }
+    }
+    dst[di] = '\0';
+}
+
+/* Validate that a path contains no dangerous shell metacharacters.
+ * Returns 1 if safe, 0 if suspicious. */
+static int path_is_safe(const char* path) {
+    for (const char* p = path; *p; p++) {
+        switch (*p) {
+            case ';': case '|': case '&': case '`':
+            case '$': case '(': case ')': case '{':
+            case '}': case '\n': case '\r':
+                return 0;
+        }
+    }
+    return 1;
+}
+
 static uint32_t fnv1a(const char* s) {
     uint32_t h = 2166136261u;
     while (*s) { h ^= (unsigned char)*s++; h *= 16777619u; }
@@ -525,10 +619,13 @@ static void track_reuse(const char* value, const char* username, const char* fil
 #ifdef _WIN32
 /* Windows doesn't have strncasecmp */
 static int strncasecmp(const char* s1, const char* s2, size_t n) {
-    while (n-- && *s1 && *s2) {
-        int c1 = tolower((unsigned char)*s1++);
-        int c2 = tolower((unsigned char)*s2++);
+    while (n--) {
+        int c1 = tolower((unsigned char)*s1);
+        int c2 = tolower((unsigned char)*s2);
         if (c1 != c2) return c1 - c2;
+        if (c1 == 0) return 0;
+        s1++;
+        s2++;
     }
     return 0;
 }
@@ -607,7 +704,21 @@ static int is_fp_hex(const char* hex, int len, const char* line) {
     
     /* Checksum context */
     if (strstr(line, "checksum") || strstr(line, "md5sum") || strstr(line, "sha256sum") || strstr(line, "integrity")) return 1;
-    
+
+    /* HTTP / cache / version context */
+    if (strstr(line, "ETag") || strstr(line, "etag:") ||
+        strstr(line, "If-None-Match") || strstr(line, "X-Request-ID") ||
+        strstr(line, "trace_id") || strstr(line, "request-id") ||
+        strstr(line, "version:") || strstr(line, "Version:")) return 1;
+
+    /* All-numeric hex (no a-f) — almost never a real hash, usually an ID/serial */
+    int has_alpha = 0;
+    for (int i = 0; i < len && !has_alpha; i++) {
+        char c = tolower(hex[i]);
+        if (c >= 'a' && c <= 'f') has_alpha = 1;
+    }
+    if (!has_alpha) return 1;
+
     return 0;
 }
 
@@ -682,9 +793,16 @@ static int check_tool(const char* tool) {
     snprintf(cmd, sizeof(cmd), "where %s >nul 2>&1", tool);
     return system(cmd) == 0;
 #else
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "which %s >/dev/null 2>&1", tool);
-    return system(cmd) == 0;
+    /* Check common paths directly instead of spawning a shell */
+    const char* search_paths[] = {
+        "/usr/bin/", "/usr/sbin/", "/usr/local/bin/", "/bin/", "/sbin/", NULL
+    };
+    char path[512];
+    for (int i = 0; search_paths[i]; i++) {
+        snprintf(path, sizeof(path), "%s%s", search_paths[i], tool);
+        if (access(path, X_OK) == 0) return 1;
+    }
+    return 0;
 #endif
 }
 
@@ -730,45 +848,53 @@ static void create_temp_dir(void) {
 }
 
 static int extract_archive(const char* archive_path) {
-    char cmd[2048];
+    char cmd[4096];
     const char* ext = strrchr(archive_path, '.');
     if (!ext) return 0;
-    
+
+    if (!path_is_safe(archive_path)) {
+        if (opt_verbose) fprintf(stderr, "[!] Skipping archive with unsafe path: %s\n", archive_path);
+        return 0;
+    }
+
+    char safe_path[MAX_PATH_LEN * 2];
+    shell_escape(archive_path, safe_path, sizeof(safe_path));
+
     create_temp_dir();
-    
+
 #ifdef _WIN32
     const char* temp = TEMP_DIR_WIN;
 #else
     const char* temp = TEMP_DIR;
 #endif
-    
+
     int success = 0;
-    
+
     /* ZIP */
     if (has_unzip && (strcasecmp(ext, ".zip") == 0)) {
 #ifdef _WIN32
-        snprintf(cmd, sizeof(cmd), "powershell -Command \"Expand-Archive -Force '%s' '%s'\" 2>nul", archive_path, temp);
+        snprintf(cmd, sizeof(cmd), "powershell -Command \"Expand-Archive -Force '%s' '%s'\" 2>nul", safe_path, temp);
 #else
-        snprintf(cmd, sizeof(cmd), "unzip -o -q '%s' -d '%s' 2>/dev/null", archive_path, temp);
+        snprintf(cmd, sizeof(cmd), "unzip -o -q '%s' -d '%s' 2>/dev/null", safe_path, temp);
 #endif
         success = (system(cmd) == 0);
     }
     /* TAR.GZ / TGZ */
     else if (has_tar && (strcasecmp(ext, ".gz") == 0 || strcasecmp(ext, ".tgz") == 0)) {
-        snprintf(cmd, sizeof(cmd), "tar -xzf '%s' -C '%s' 2>/dev/null", archive_path, temp);
+        snprintf(cmd, sizeof(cmd), "tar -xzf '%s' -C '%s' 2>/dev/null", safe_path, temp);
         success = (system(cmd) == 0);
     }
     /* TAR.BZ2 */
     else if (has_tar && strcasecmp(ext, ".bz2") == 0) {
-        snprintf(cmd, sizeof(cmd), "tar -xjf '%s' -C '%s' 2>/dev/null", archive_path, temp);
+        snprintf(cmd, sizeof(cmd), "tar -xjf '%s' -C '%s' 2>/dev/null", safe_path, temp);
         success = (system(cmd) == 0);
     }
     /* Plain TAR */
     else if (has_tar && strcasecmp(ext, ".tar") == 0) {
-        snprintf(cmd, sizeof(cmd), "tar -xf '%s' -C '%s' 2>/dev/null", archive_path, temp);
+        snprintf(cmd, sizeof(cmd), "tar -xf '%s' -C '%s' 2>/dev/null", safe_path, temp);
         success = (system(cmd) == 0);
     }
-    
+
     return success;
 }
 
@@ -802,51 +928,57 @@ static void collect_archive(const char* archive_path) {
 
 static void collect_sqlite(const char* db_path) {
     if (!opt_collectors) return;
-    
+
     /* Check file size */
     struct stat st;
     if (stat(db_path, &st) != 0) return;
     if (st.st_size > 100 * 1024 * 1024) return;  /* Max 100MB */
-    
+
+    if (!path_is_safe(db_path)) {
+        if (opt_verbose) fprintf(stderr, "[!] Skipping SQLite with unsafe path: %s\n", db_path);
+        return;
+    }
+
+    char safe_path[MAX_PATH_LEN * 2];
+    shell_escape(db_path, safe_path, sizeof(safe_path));
+
     if (has_sqlite3) {
-        /* Use sqlite3 CLI to dump */
-        char cmd[2048];
+        char cmd[4096];
         char dump_path[MAX_PATH_LEN];
-        
+
 #ifdef _WIN32
         snprintf(dump_path, sizeof(dump_path), "%s\\sqlite_dump.txt", TEMP_DIR_WIN);
         create_temp_dir();
-        snprintf(cmd, sizeof(cmd), "sqlite3 \"%s\" .dump > \"%s\" 2>nul", db_path, dump_path);
+        snprintf(cmd, sizeof(cmd), "sqlite3 \"%s\" .dump > \"%s\" 2>nul", safe_path, dump_path);
 #else
         snprintf(dump_path, sizeof(dump_path), "%s/sqlite_dump.txt", TEMP_DIR);
         create_temp_dir();
-        snprintf(cmd, sizeof(cmd), "sqlite3 '%s' .dump > '%s' 2>/dev/null", db_path, dump_path);
+        snprintf(cmd, sizeof(cmd), "sqlite3 '%s' .dump > '%s' 2>/dev/null", safe_path, dump_path);
 #endif
-        
+
         if (opt_verbose) fprintf(stderr, "[*] Dumping SQLite: %s\n", db_path);
-        
+
         if (system(cmd) == 0) {
             scan_file(dump_path);
         }
         cleanup_temp_dir();
     }
     else if (has_strings) {
-        /* Fallback: strings extraction */
-        char cmd[2048];
+        char cmd[4096];
         char strings_path[MAX_PATH_LEN];
-        
+
 #ifdef _WIN32
         snprintf(strings_path, sizeof(strings_path), "%s\\strings_out.txt", TEMP_DIR_WIN);
         create_temp_dir();
-        snprintf(cmd, sizeof(cmd), "strings \"%s\" > \"%s\" 2>nul", db_path, strings_path);
+        snprintf(cmd, sizeof(cmd), "strings \"%s\" > \"%s\" 2>nul", safe_path, strings_path);
 #else
         snprintf(strings_path, sizeof(strings_path), "%s/strings_out.txt", TEMP_DIR);
         create_temp_dir();
-        snprintf(cmd, sizeof(cmd), "strings '%s' > '%s' 2>/dev/null", db_path, strings_path);
+        snprintf(cmd, sizeof(cmd), "strings '%s' > '%s' 2>/dev/null", safe_path, strings_path);
 #endif
-        
+
         if (opt_verbose) fprintf(stderr, "[*] Strings from SQLite: %s\n", db_path);
-        
+
         if (system(cmd) == 0) {
             scan_file(strings_path);
         }
@@ -861,37 +993,45 @@ static void collect_sqlite(const char* db_path) {
 static void collect_git(const char* git_dir) {
     if (!opt_collectors) return;
     if (!has_git) return;
-    
+
     /* git_dir should be the .git directory, get parent */
     char repo_path[MAX_PATH_LEN];
     strncpy(repo_path, git_dir, sizeof(repo_path) - 1);
-    
+    repo_path[sizeof(repo_path) - 1] = '\0';
+
     /* Remove .git suffix */
     char* git_suffix = strstr(repo_path, "/.git");
     if (!git_suffix) git_suffix = strstr(repo_path, "\\.git");
     if (git_suffix) *git_suffix = '\0';
     else return;
-    
+
+    if (!path_is_safe(repo_path)) {
+        if (opt_verbose) fprintf(stderr, "[!] Skipping git repo with unsafe path: %s\n", repo_path);
+        return;
+    }
+
+    char safe_repo[MAX_PATH_LEN * 2];
+    shell_escape(repo_path, safe_repo, sizeof(safe_repo));
+
     if (opt_verbose) fprintf(stderr, "[*] Scanning git history: %s\n", repo_path);
-    
-    char cmd[2048];
+
+    char cmd[4096];
     char log_path[MAX_PATH_LEN];
-    
+
 #ifdef _WIN32
     snprintf(log_path, sizeof(log_path), "%s\\git_history.txt", TEMP_DIR_WIN);
     create_temp_dir();
-    /* Get last 100 commits with diffs */
-    snprintf(cmd, sizeof(cmd), "git -C \"%s\" log -p -100 --all > \"%s\" 2>nul", repo_path, log_path);
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" log -p -100 --all > \"%s\" 2>nul", safe_repo, log_path);
 #else
     snprintf(log_path, sizeof(log_path), "%s/git_history.txt", TEMP_DIR);
     create_temp_dir();
-    snprintf(cmd, sizeof(cmd), "git -C '%s' log -p -100 --all > '%s' 2>/dev/null", repo_path, log_path);
+    snprintf(cmd, sizeof(cmd), "git -C '%s' log -p -100 --all > '%s' 2>/dev/null", safe_repo, log_path);
 #endif
-    
+
     if (system(cmd) == 0) {
         scan_file(log_path);
     }
-    
+
     /* Also scan git config for credentials */
     char config_path[MAX_PATH_LEN];
     snprintf(config_path, sizeof(config_path), "%s/.git/config", repo_path);
@@ -899,7 +1039,7 @@ static void collect_git(const char* git_dir) {
     if (stat(config_path, &st) == 0) {
         scan_file(config_path);
     }
-    
+
     cleanup_temp_dir();
 }
 
@@ -939,7 +1079,13 @@ static void check_windows_artifacts(const char* path) {
  * DEDUP & INODE
  * ============================================================================ */
 
-static void init_tables(void) { memset(dedup_table, 0, sizeof(dedup_table)); memset(inode_table, 0, sizeof(inode_table)); }
+static void init_tables(void) {
+    memset(dedup_table, 0, sizeof(dedup_table));
+    memset(inode_table, 0, sizeof(inode_table));
+    memset(user_hash_table, 0, sizeof(user_hash_table));
+    memset(reuse_table, 0, sizeof(reuse_table));
+    memset(user_registry, 0, sizeof(user_registry));
+}
 
 static void free_tables(void) {
     for (int i = 0; i < HASH_TABLE_SIZE; i++) {
@@ -948,6 +1094,15 @@ static void free_tables(void) {
         InodeEntry* e = inode_table[i];
         while (e) { InodeEntry* n = e->next; free(e); e = n; }
     }
+    for (int i = 0; i < USER_HASH_SIZE; i++) {
+        UserHashEntry* e = user_hash_table[i];
+        while (e) { UserHashEntry* n = e->next; free(e); e = n; }
+    }
+    for (int i = 0; i < REUSE_HASH_SIZE; i++) {
+        ReuseEntry* e = reuse_table[i];
+        while (e) { ReuseEntry* n = e->next; free(e); e = n; }
+    }
+    user_registry_free();
 }
 
 static int check_dup(uint32_t h) {
@@ -1015,6 +1170,11 @@ static void add_finding(Category cat, const char* type, Confidence conf, const c
     if (opt_show_values) strncpy(f->value_preview, val, sizeof(f->value_preview)-1);
     else redact(val, f->value_preview, sizeof(f->value_preview));
     get_owner(path, f->owner, sizeof(f->owner));
+    /* Increment credential count in user registry */
+    if (f->owner[0]) {
+        UserRegEntry* ure = user_registry_find(f->owner);
+        if (ure) ure->credential_count++;
+    }
     if (ctx_b) strncpy(f->context_before, ctx_b, sizeof(f->context_before)-1);
     if (ctx_a) strncpy(f->context_after, ctx_a, sizeof(f->context_after)-1);
     
@@ -1116,6 +1276,9 @@ static void scan_line(const char* line, const char* path, int lnum, long off, co
      * ======================================================================== */
     
     /* 1. Variable assignments: password=xxx, password: xxx, password => xxx */
+    /* Early exit: skip expensive pattern loop if line has no assignment operators */
+    int has_assign = (strchr(line, '=') || strchr(line, ':'));
+    if (!has_assign) goto skip_cred_vars;
     for (int i = 0; CRED_VAR_PATTERNS[i]; i++) {
         const char* pattern = CRED_VAR_PATTERNS[i];
         const char* pos = line;
@@ -1200,7 +1363,8 @@ static void scan_line(const char* line, const char* path, int lnum, long off, co
             pos++;
         }
     }
-    
+    skip_cred_vars:
+
     /* 2. URL embedded credentials: mysql://user:pass@host */
     for (int i = 0; URL_SCHEMES[i]; i++) {
         const char* scheme = URL_SCHEMES[i];
@@ -1524,8 +1688,6 @@ static void scan_line(const char* line, const char* path, int lnum, long off, co
     /* Base64 encoded secrets (look for base64 after secret keywords) */
     for (int i = 0; BASE64_SECRET_CONTEXTS[i]; i++) {
         const char* ctx = line;
-        char ctx_lower[32];
-        strncpy(ctx_lower, BASE64_SECRET_CONTEXTS[i], sizeof(ctx_lower)-1);
         while ((ctx = strcasestr_local(ctx, BASE64_SECRET_CONTEXTS[i])) != NULL) {
             /* Find = or : after keyword */
             const char* eq = ctx + strlen(BASE64_SECRET_CONTEXTS[i]);
@@ -1579,11 +1741,6 @@ static void scan_line(const char* line, const char* path, int lnum, long off, co
                 add_finding(CAT_TOKEN, "k8s_secret", CONF_MEDIUM, path, lnum, off, kv, -1, "Kubernetes secret", cb, ca);
             }
         }
-    }
-    
-    /* SSH Private Key content (after BEGIN marker, look for key data) */
-    if (strstr(line, "PRIVATE KEY")) {
-        /* Already handled above, but mark for multi-line capture */
     }
     
     /* .NET Machine Key */
@@ -1644,16 +1801,211 @@ static void scan_line(const char* line, const char* path, int lnum, long off, co
             }
         }
     }
+
+    /* ========================================================================
+     * PWDUMP FORMAT: user:RID:LMhash:NThash:::
+     * ======================================================================== */
+    {
+        const char* p = line;
+        while (*p) {
+            /* Find pattern: word:number:32hex:32hex::: */
+            const char* start = p;
+            /* Skip to first colon (username) */
+            while (*p && *p != ':' && *p != '\n') p++;
+            if (*p != ':') break;
+            int ulen = p - start;
+            if (ulen < 1 || ulen > 64) { p++; continue; }
+            p++; /* skip colon */
+
+            /* RID field - must be numeric */
+            const char* rid_start = p;
+            while (*p && isdigit(*p)) p++;
+            if (*p != ':' || p == rid_start) { p = start + ulen + 1; continue; }
+            p++; /* skip colon */
+
+            /* LM hash - exactly 32 hex chars */
+            int lm_ok = 1;
+            for (int i = 0; i < 32 && lm_ok; i++) {
+                if (!is_hex(p[i])) lm_ok = 0;
+            }
+            if (!lm_ok || p[32] != ':') { p = start + ulen + 1; continue; }
+            char lm_hash[33];
+            strncpy(lm_hash, p, 32); lm_hash[32] = '\0';
+            p += 33; /* 32 hex + colon */
+
+            /* NT hash - exactly 32 hex chars */
+            int nt_ok = 1;
+            for (int i = 0; i < 32 && nt_ok; i++) {
+                if (!is_hex(p[i])) nt_ok = 0;
+            }
+            if (!nt_ok) { p = start + ulen + 1; continue; }
+            char nt_hash[33];
+            strncpy(nt_hash, p, 32); nt_hash[32] = '\0';
+            p += 32;
+
+            /* Should end with ::: (or end of line) */
+            if (p[0] == ':' && p[1] == ':' && p[2] == ':') {
+                char user[65];
+                strncpy(user, start, ulen); user[ulen] = '\0';
+
+                /* Full pwdump line */
+                int total = strlen(start);
+                char pwdump_val[512];
+                strncpy(pwdump_val, start, total < 511 ? total : 511);
+                pwdump_val[total < 511 ? total : 511] = '\0';
+
+                /* NT hash */
+                char nt_lower[33];
+                strncpy(nt_lower, nt_hash, 33);
+                str_lower(nt_lower);
+                track_user_hash(user, "ntlm", path);
+
+                if (strcmp(nt_lower, "31d6cfe0d16ae931b73c59d7e0c089c0") != 0) { /* not empty NTLM */
+                    char reason[128];
+                    snprintf(reason, sizeof(reason), "NTLM hash for user: %s", user);
+                    add_finding(CAT_PASSWORD_HASH, "ntlm_pwdump", CONF_HIGH, path, lnum, off,
+                               nt_hash, 1000, reason, cb, ca);
+                }
+
+                /* LM hash - only if not empty */
+                char lm_lower[33];
+                strncpy(lm_lower, lm_hash, 33);
+                str_lower(lm_lower);
+                if (strcmp(lm_lower, "aad3b435b51404eeaad3b435b51404ee") != 0) {
+                    char reason[128];
+                    snprintf(reason, sizeof(reason), "LM hash for user: %s", user);
+                    add_finding(CAT_PASSWORD_HASH, "lm_hash", CONF_HIGH, path, lnum, off,
+                               lm_hash, 3000, reason, cb, ca);
+                }
+            }
+            break; /* pwdump is one per line */
+        }
+    }
+
+    /* ========================================================================
+     * GPP CPASSWORD: cpassword="..." in XML
+     * ======================================================================== */
+    {
+        const char* cp = strcasestr_local(line, "cpassword=\"");
+        if (cp) {
+            cp += 11;
+            int vlen = 0;
+            while (cp[vlen] && cp[vlen] != '"' && vlen < 500) vlen++;
+            if (vlen > 2) {
+                char val[512];
+                strncpy(val, cp, vlen); val[vlen] = '\0';
+
+                char user[64] = "";
+                const char* un = strcasestr_local(line, "userName=\"");
+                if (un) {
+                    un += 10;
+                    int ulen = 0;
+                    while (un[ulen] && un[ulen] != '"' && ulen < 63) ulen++;
+                    strncpy(user, un, ulen); user[ulen] = '\0';
+                }
+
+                char reason[256];
+                snprintf(reason, sizeof(reason), "GPP cpassword%s%s (trivially decryptable)",
+                        user[0] ? " for user: " : "", user);
+                if (user[0]) track_user_hash(user, "gpp_cpassword", path);
+                add_finding(CAT_PLAINTEXT, "gpp_cpassword", CONF_HIGH, path, lnum, off,
+                           val, -1, reason, cb, ca);
+            }
+        }
+    }
+
+    /* ========================================================================
+     * BITLOCKER RECOVERY KEY: XXXXXX-XXXXXX-XXXXXX-XXXXXX-XXXXXX-XXXXXX-XXXXXX-XXXXXX
+     * ======================================================================== */
+    {
+        const char* p = line;
+        while (*p) {
+            /* Look for 6-digit group */
+            if (isdigit(p[0]) && isdigit(p[1]) && isdigit(p[2]) &&
+                isdigit(p[3]) && isdigit(p[4]) && isdigit(p[5]) && p[6] == '-') {
+                /* Verify full 8 groups of 6 digits */
+                const char* start = p;
+                int valid = 1;
+                for (int g = 0; g < 8 && valid; g++) {
+                    for (int d = 0; d < 6 && valid; d++) {
+                        if (!isdigit(p[d])) valid = 0;
+                    }
+                    p += 6;
+                    if (g < 7) {
+                        if (*p != '-') valid = 0;
+                        else p++;
+                    }
+                }
+                /* Total length: 8*6 + 7 dashes = 55 chars */
+                if (valid && (p - start) == 55) {
+                    /* Verify not all zeros */
+                    int all_zero = 1;
+                    for (int i = 0; i < 55 && all_zero; i++) {
+                        if (start[i] != '0' && start[i] != '-') all_zero = 0;
+                    }
+                    /* BitLocker constraint: every 6-digit group is divisible by 11.
+                     * Cuts FPs from random ID strings to near-zero. */
+                    int mod11_ok = 1;
+                    for (int g = 0; g < 8 && mod11_ok; g++) {
+                        const char* gp = start + g * 7;  /* 6 digits + 1 dash stride */
+                        long v = 0;
+                        for (int d = 0; d < 6; d++) v = v * 10 + (gp[d] - '0');
+                        if (v % 11 != 0 || v > 720885) mod11_ok = 0;
+                    }
+                    if (!all_zero && mod11_ok) {
+                        char key[56];
+                        strncpy(key, start, 55); key[55] = '\0';
+                        add_finding(CAT_TOKEN, "bitlocker_recovery_key", CONF_HIGH, path, lnum, off,
+                                   key, -1, "BitLocker recovery key", cb, ca);
+                    }
+                }
+                continue;
+            }
+            p++;
+        }
+    }
+
+    /* ========================================================================
+     * WPA PMKID / hashcat 22000 format
+     * ======================================================================== */
+    if (strncmp(line, "WPA*", 4) == 0 || strstr(line, "*PMKID*") || strncmp(line, "PMKID*", 6) == 0) {
+        add_finding(CAT_NETWORK_AUTH, "wpa_pmkid", CONF_HIGH, path, lnum, off,
+                   line, 22000, "WPA PMKID hash", cb, ca);
+    }
+
+    /* ========================================================================
+     * HTPASSWD INLINE: user:$hash... format (when file is htpasswd)
+     * ======================================================================== */
+    if (strcasestr_local(path, "htpasswd")) {
+        const char* colon = strchr(line, ':');
+        if (colon && colon > line && colon - line < 64) {
+            const char* hash = colon + 1;
+            int hlen = strlen(hash);
+            while (hlen > 0 && isspace(hash[hlen-1])) hlen--;
+            if (hlen > 10 && (hash[0] == '$' || hash[0] == '{' || hash[0] == '*')) {
+                char user[64];
+                int ulen = colon - line;
+                strncpy(user, line, ulen); user[ulen] = '\0';
+                /* Don't add_finding here - scan_line() will already match the hash.
+                 * Just track the user correlation. */
+                const char* htype = "htpasswd";
+                if (strncmp(hash, "$apr1$", 6) == 0) htype = "apr1";
+                else if (strncmp(hash, "{SHA}", 5) == 0) htype = "sha_apache";
+                else if (strncmp(hash, "$2", 2) == 0) htype = "bcrypt";
+                track_user_hash(user, htype, path);
+            }
+        }
+    }
 }
 
 static int should_scan(const char* fn) {
     const char* names[] = {
-        "shadow", "passwd", ".env", "htpasswd", "credentials", 
+        "shadow", "passwd", ".env", "htpasswd", "credentials",
         "wp-config.php", "config.php", "database.php",
         /* Cloud/K8s */
         "credentials", "config", "secrets", ".npmrc", ".pypirc",
-        ".docker", "kubeconfig", ".kube", ".aws", 
-        "terraform.tfvars", "variables.tf", 
+        ".docker", "kubeconfig", ".kube", ".aws",
+        "terraform.tfvars", "variables.tf",
         "docker-compose.yml", "docker-compose.yaml",
         "values.yaml", "secrets.yaml", "secrets.yml",
         /* Git */
@@ -1661,6 +2013,19 @@ static int should_scan(const char* fn) {
         /* Web config */
         "web.config", "appsettings.json", "app.config",
         "settings.py", "local_settings.py",
+        /* Shell/SQL history */
+        ".bash_history", ".zsh_history", ".sh_history",
+        ".mysql_history", ".psql_history", ".python_history",
+        /* Windows artifacts */
+        "ConsoleHost_history.txt", "Unattend.xml", "autounattend.xml",
+        "sysprep.inf", "Groups.xml", "Services.xml",
+        "ScheduledTasks.xml", "DataSources.xml", "Drives.xml",
+        "Printers.xml", "applicationHost.config",
+        /* Linux security */
+        "opasswd", "krb5.keytab",
+        /* Credential files */
+        "hashes", "hashdump", "secretsdump", "pwdump",
+        "loot", "ntlm", "capture",
         NULL
     };
     for (int i = 0; names[i]; i++) if (strcasecmp(fn, names[i])==0 || strstr(fn, names[i])) return 1;
@@ -1669,11 +2034,24 @@ static int should_scan(const char* fn) {
     const char* exts[] = {
         ".php", ".inc", ".env", ".ini", ".conf", ".yml", ".yaml", ".json", ".xml", ".sql", ".dump",
         ".bak", ".old", ".log", ".txt", ".py", ".sh", ".htpasswd", ".swp",
-        /* Additional */
-        ".tf", ".tfvars", ".hcl",  /* Terraform */
-        ".properties",  /* Java */
-        ".toml",  /* Rust/Python */
-        ".pem", ".key", ".crt", ".p12", ".pfx",  /* Certs/Keys */
+        /* Terraform */
+        ".tf", ".tfvars", ".hcl",
+        /* Java */
+        ".properties",
+        /* Rust/Python */
+        ".toml",
+        /* Certs/Keys */
+        ".pem", ".key", ".crt", ".p12", ".pfx",
+        /* History */
+        ".history",
+        /* Windows */
+        ".reg", ".rdp", ".rdg",
+        /* Databases/Crypto */
+        ".kdbx", ".keytab",
+        /* PowerShell */
+        ".ps1", ".psm1", ".psd1",
+        /* Config */
+        ".cfg", ".config", ".cnf",
         NULL
     };
     for (int i = 0; exts[i]; i++) if (strcasecmp(ext, exts[i])==0) return 1;
@@ -1683,7 +2061,12 @@ static int should_scan(const char* fn) {
 }
 
 static int should_skip(const char* dn) {
-    const char* skip[] = {"node_modules","__pycache__",".git","vendor","venv","proc","sys","dev","Windows","Program Files",NULL};
+    const char* skip[] = {
+        "node_modules", "__pycache__", ".git", "vendor", "venv",
+        "sys", "dev", "Windows", "Program Files", "Program Files (x86)",
+        NULL
+    };
+    /* Note: "proc" removed - handled selectively in scan_dir() */
     for (int i = 0; skip[i]; i++) if (strcmp(dn, skip[i])==0) return 1;
     return 0;
 }
@@ -1767,10 +2150,19 @@ static void scan_pcredz_line(const char* line, const char* path, int lnum) {
                    line, -1, "Kerberos ticket data (Pcredz)", NULL, NULL);
     }
     
-    /* WPA/WPA2 handshake reference */
-    if (strcasestr_local(line, "WPA") || strcasestr_local(line, "PMKID") || strcasestr_local(line, "EAPOL")) {
-        add_finding(CAT_NETWORK_AUTH, "wifi_handshake", CONF_HIGH, path, lnum, 0,
-                   line, -1, "WiFi handshake/PMKID reference", NULL, NULL);
+    /* WPA/WPA2 handshake reference - tightened to avoid FPs.
+     * Bare "WPA" matches wpa_supplicant config, log lines, docs.
+     * Skip if scan_line() already produced a wpa_pmkid finding for this line. */
+    if (strncmp(line, "WPA*", 4) != 0 && strncmp(line, "PMKID*", 6) != 0) {
+        int hit = 0;
+        if (strstr(line, "PMKID:") || strstr(line, "[PMKID]")) hit = 1;
+        else if (strstr(line, "EAPOL ") || strstr(line, "EAPOL-")) hit = 1;
+        else if (strstr(line, "[WPA-") || strstr(line, "WPA-PSK") ||
+                 strstr(line, "WPA2-PSK") || strstr(line, "[WPA]")) hit = 1;
+        if (hit) {
+            add_finding(CAT_NETWORK_AUTH, "wifi_handshake", CONF_MEDIUM, path, lnum, 0,
+                       line, -1, "WiFi handshake/PMKID reference", NULL, NULL);
+        }
     }
 }
 
@@ -1888,13 +2280,19 @@ static void scan_dir(const char* path, int depth) {
             if (strcmp(e->d_name, ".git") == 0 && has_git && opt_collectors) {
                 collect_git(fp);
             }
+#ifndef _WIN32
+            /* Selective /proc scanning - only environ files */
+            else if (strcmp(e->d_name, "proc") == 0 && depth == 0 && strcmp(path, "/") == 0) {
+                if (opt_collectors) collect_proc_environ();
+            }
+#endif
             else if (!should_skip(e->d_name)) {
                 scan_dir(fp, depth + 1);
             }
         }
         else if (S_ISREG(st.st_mode)) {
             const char* ext = strrchr(e->d_name, '.');
-            
+
             /* Check for archives */
             if (ext && opt_collectors) {
                 if (strcasecmp(ext, ".zip") == 0 || strcasecmp(ext, ".tar") == 0 ||
@@ -1908,10 +2306,39 @@ static void scan_dir(const char* path, int depth) {
                     collect_sqlite(fp);
                 }
             }
-            
+
             /* Check for Windows artifacts */
             check_windows_artifacts(fp);
-            
+
+            /* Special file type handlers */
+            if (ext) {
+                if (strcasecmp(ext, ".kdbx") == 0) {
+                    detect_keepass_db(fp);
+                }
+                else if (strcasecmp(ext, ".rdp") == 0 || strcasecmp(ext, ".rdg") == 0) {
+                    detect_rdp_file(fp);
+                }
+#ifdef _WIN32
+                else if (strcasecmp(ext, ".reg") == 0) {
+                    scan_reg_file(fp);
+                }
+#endif
+            }
+
+#ifndef _WIN32
+            /* Shell/SQL history files get specialized scanning */
+            if (strcasestr_local(e->d_name, "_history") || strcasestr_local(e->d_name, ".history")) {
+                if (strcasestr_local(e->d_name, "mysql") || strcasestr_local(e->d_name, "psql"))
+                    collect_sql_history(fp);
+                else
+                    collect_shell_history(fp);
+            }
+            /* htpasswd files get specialized parsing */
+            if (strcasestr_local(e->d_name, "htpasswd")) {
+                collect_htpasswd(fp);
+            }
+#endif
+
             /* Normal file scan */
             if (should_scan(e->d_name)) {
                 scan_file(fp);
@@ -1956,11 +2383,750 @@ static void collect_shadow(void) {
         else if (strncmp(hash,"$1$",3)==0) { t="md5crypt"; hc=500; }
         char reason[128];
         snprintf(reason, sizeof(reason), "Shadow: %s%s", user, locked?" [LOCKED]":"");
+        track_user_hash(user, t, "/etc/shadow");
+        /* Mark user in registry as having a password hash */
+        UserRegEntry* ure = user_registry_find(user);
+        if (ure) { ure->has_password = 1; ure->credential_count++; }
         add_finding(CAT_PASSWORD_HASH, t, CONF_HIGH, "/etc/shadow", lnum, 0, hash, hc, reason, NULL, NULL);
     }
     fclose(f);
 }
-#endif
+
+/* ============================================================================
+ * LINUX COLLECTOR: /etc/passwd - User Registry
+ * ============================================================================ */
+
+static void collect_passwd(void) {
+    FILE* f = fopen("/etc/passwd", "r");
+    if (!f) return;
+    char ln[MAX_LINE];
+    while (fgets(ln, sizeof(ln), f)) {
+        /* format: user:x:uid:gid:gecos:home:shell */
+        char* fields[7] = {0};
+        int fc = 0;
+        char* p = ln;
+        for (int i = 0; i < 7 && p; i++) {
+            fields[i] = p;
+            char* sep = strchr(p, ':');
+            if (sep) { *sep = '\0'; p = sep + 1; }
+            else { /* strip newline */ char* nl = strchr(p, '\n'); if (nl) *nl = '\0'; p = NULL; }
+            fc++;
+        }
+        if (fc >= 7 && fields[0][0]) {
+            int uid = atoi(fields[2] ? fields[2] : "0");
+            user_registry_add(fields[0], uid, fields[5], fields[6]);
+            /* Flag UID 0 accounts that are not root */
+            if (uid == 0 && strcmp(fields[0], "root") != 0) {
+                char reason[128];
+                snprintf(reason, sizeof(reason), "UID 0 non-root account: %s", fields[0]);
+                add_finding(CAT_TOKEN, "uid0_account", CONF_HIGH, "/etc/passwd", 0, 0,
+                           fields[0], -1, reason, NULL, NULL);
+            }
+        }
+    }
+    fclose(f);
+}
+
+/* ============================================================================
+ * LINUX COLLECTOR: Shell History - Passwords in commands
+ * ============================================================================ */
+
+typedef struct { const char* pattern; const char* name; } HistoryPattern;
+
+static const HistoryPattern HISTORY_PATTERNS[] = {
+    {"mysql -p", "mysql_password"},
+    {"mysql --password", "mysql_password"},
+    {"mysqldump -p", "mysql_password"},
+    {"sshpass -p", "sshpass_password"},
+    {"sshpass -P", "sshpass_password"},
+    {"curl -u ", "curl_credential"},
+    {"curl --user ", "curl_credential"},
+    {"wget --password", "wget_password"},
+    {"wget --ftp-password", "wget_password"},
+    {"htpasswd ", "htpasswd_cmd"},
+    {"openssl passwd", "openssl_password"},
+    {"net use ", "net_use_credential"},
+    {"mount -o password", "mount_password"},
+    {"mount.cifs", "cifs_credential"},
+    {"psql -W", "psql_password"},
+    {"pgpassword=", "postgres_env"},
+    {"PGPASSWORD=", "postgres_env"},
+    {"MYSQL_PWD=", "mysql_env"},
+    {"ldapsearch -w ", "ldap_password"},
+    {"ldapsearch -W", "ldap_password"},
+    {"kinit ", "kerberos_cmd"},
+    {"runas /user:", "runas_credential"},
+    {"cmdkey /add:", "cmdkey_credential"},
+    {NULL, NULL}
+};
+
+static void collect_shell_history(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+
+    char ln[MAX_LINE];
+    int lnum = 0;
+    while (fgets(ln, sizeof(ln), f)) {
+        lnum++;
+        int len = strlen(ln);
+        while (len > 0 && (ln[len-1] == '\n' || ln[len-1] == '\r')) ln[--len] = '\0';
+        if (len < 8) continue;
+
+        for (int i = 0; HISTORY_PATTERNS[i].pattern; i++) {
+            if (strcasestr_local(ln, HISTORY_PATTERNS[i].pattern)) {
+                add_finding(CAT_PLAINTEXT, HISTORY_PATTERNS[i].name, CONF_HIGH, path, lnum, 0,
+                           ln, -1, "Password in shell history", NULL, NULL);
+                break;
+            }
+        }
+        /* Also check generic password assignments in history */
+        if (strcasestr_local(ln, "password=") || strcasestr_local(ln, "passwd=") ||
+            strcasestr_local(ln, "SECRET_KEY=") || strcasestr_local(ln, "API_KEY=")) {
+            add_finding(CAT_PLAINTEXT, "history_credential", CONF_MEDIUM, path, lnum, 0,
+                       ln, -1, "Credential in shell history", NULL, NULL);
+        }
+    }
+    fclose(f);
+}
+
+/* ============================================================================
+ * LINUX COLLECTOR: SQL History
+ * ============================================================================ */
+
+static void collect_sql_history(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+
+    char ln[MAX_LINE];
+    int lnum = 0;
+    while (fgets(ln, sizeof(ln), f)) {
+        lnum++;
+        int len = strlen(ln);
+        while (len > 0 && (ln[len-1] == '\n' || ln[len-1] == '\r')) ln[--len] = '\0';
+        if (len < 10) continue;
+
+        if (strcasestr_local(ln, "IDENTIFIED BY") ||
+            strcasestr_local(ln, "SET PASSWORD") ||
+            strcasestr_local(ln, "GRANT ") ||
+            strcasestr_local(ln, "CREATE USER") ||
+            strcasestr_local(ln, "ALTER USER") ||
+            strcasestr_local(ln, "PASSWORD(")) {
+            add_finding(CAT_PLAINTEXT, "sql_history_credential", CONF_HIGH, path, lnum, 0,
+                       ln, -1, "SQL password in history", NULL, NULL);
+        }
+    }
+    fclose(f);
+}
+
+/* ============================================================================
+ * LINUX COLLECTOR: NetworkManager WiFi PSK
+ * ============================================================================ */
+
+static void collect_networkmanager(void) {
+    const char* nm_dir = "/etc/NetworkManager/system-connections";
+    DIR* dir = opendir(nm_dir);
+    if (!dir) return;
+
+    struct dirent* e;
+    while ((e = readdir(dir)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        char fp[MAX_PATH_LEN];
+        snprintf(fp, sizeof(fp), "%s/%s", nm_dir, e->d_name);
+
+        FILE* f = fopen(fp, "r");
+        if (!f) continue;
+
+        char ln[MAX_LINE];
+        int lnum = 0;
+        char ssid[128] = "";
+        while (fgets(ln, sizeof(ln), f)) {
+            lnum++;
+            int len = strlen(ln);
+            while (len > 0 && (ln[len-1] == '\n' || ln[len-1] == '\r')) ln[--len] = '\0';
+
+            if (strncmp(ln, "ssid=", 5) == 0) {
+                strncpy(ssid, ln + 5, sizeof(ssid) - 1);
+            }
+            if (strncmp(ln, "psk=", 4) == 0 && len > 4) {
+                char reason[256];
+                snprintf(reason, sizeof(reason), "WiFi PSK for SSID: %s", ssid[0] ? ssid : "(unknown)");
+                add_finding(CAT_PLAINTEXT, "wifi_psk", CONF_HIGH, fp, lnum, 0,
+                           ln + 4, -1, reason, NULL, NULL);
+            }
+        }
+        fclose(f);
+    }
+    closedir(dir);
+}
+
+/* ============================================================================
+ * LINUX COLLECTOR: /etc/security/opasswd
+ * ============================================================================ */
+
+static void collect_opasswd(void) {
+    FILE* f = fopen("/etc/security/opasswd", "r");
+    if (!f) return;
+
+    char ln[MAX_LINE];
+    int lnum = 0;
+    while (fgets(ln, sizeof(ln), f)) {
+        lnum++;
+        int len = strlen(ln);
+        while (len > 0 && (ln[len-1] == '\n' || ln[len-1] == '\r')) ln[--len] = '\0';
+        if (len < 5) continue;
+
+        /* Format: user:count:hash1,hash2,... */
+        char* c1 = strchr(ln, ':');
+        if (!c1) continue;
+        char user[64];
+        int ul = c1 - ln;
+        if (ul >= 64 || ul <= 0) continue;
+        strncpy(user, ln, ul); user[ul] = '\0';
+
+        char* c2 = strchr(c1 + 1, ':');
+        if (!c2) continue;
+        char* hashes = c2 + 1;
+        if (strlen(hashes) < 3) continue;
+
+        char reason[128];
+        snprintf(reason, sizeof(reason), "Old password for user: %s", user);
+        /* Scan each comma-separated hash */
+        char* tok = hashes;
+        while (tok && *tok) {
+            char* comma = strchr(tok, ',');
+            if (comma) *comma = '\0';
+            if (strlen(tok) > 5) {
+                track_user_hash(user, "opasswd", "/etc/security/opasswd");
+                add_finding(CAT_PASSWORD_HASH, "opasswd", CONF_HIGH,
+                           "/etc/security/opasswd", lnum, 0, tok, -1, reason, NULL, NULL);
+            }
+            if (comma) tok = comma + 1; else break;
+        }
+    }
+    fclose(f);
+}
+
+/* ============================================================================
+ * LINUX COLLECTOR: /proc/*/environ - Secrets in process environment
+ * ============================================================================ */
+
+static void collect_proc_environ(void) {
+    DIR* proc = opendir("/proc");
+    if (!proc) return;
+
+    struct dirent* e;
+    int count = 0;
+    while ((e = readdir(proc)) != NULL && count < 200) {
+        /* Only numeric PID directories */
+        if (!isdigit(e->d_name[0])) continue;
+
+        char envpath[256];
+        snprintf(envpath, sizeof(envpath), "/proc/%s/environ", e->d_name);
+
+        FILE* f = fopen(envpath, "r");
+        if (!f) continue;
+        count++;
+
+        /* environ is NUL-delimited */
+        char buf[32768];
+        size_t rd = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[rd] = '\0';
+
+        size_t pos = 0;
+        while (pos < rd) {
+            const char* entry = buf + pos;
+            size_t elen = strlen(entry);
+            if (elen == 0) { pos++; continue; }
+            pos += elen + 1;
+
+            /* Check if key matches credential patterns */
+            const char* eq = strchr(entry, '=');
+            if (!eq || eq == entry) continue;
+            int klen = eq - entry;
+            const char* val = eq + 1;
+            int vlen = strlen(val);
+
+            if (vlen < 4 || vlen > 500) continue;
+
+            /* Check key against known secret env var names */
+            char key_lower[128];
+            if (klen >= (int)sizeof(key_lower)) continue;
+            for (int i = 0; i < klen; i++) key_lower[i] = tolower((unsigned char)entry[i]);
+            key_lower[klen] = '\0';
+
+            int is_secret = 0;
+            const char* secret_keys[] = {
+                "password", "passwd", "secret", "api_key", "apikey",
+                "access_key", "token", "auth", "private_key", "credential",
+                "db_pass", "mysql_pwd", "pgpassword", "redis_pass",
+                NULL
+            };
+            for (int i = 0; secret_keys[i]; i++) {
+                if (strstr(key_lower, secret_keys[i])) { is_secret = 1; break; }
+            }
+
+            if (is_secret) {
+                char reason[256];
+                snprintf(reason, sizeof(reason), "PID %s env: %.*s=...", e->d_name, klen, entry);
+                add_finding(CAT_PLAINTEXT, "process_env_secret", CONF_HIGH,
+                           envpath, 0, 0, val, -1, reason, NULL, NULL);
+            }
+        }
+    }
+    closedir(proc);
+}
+
+/* ============================================================================
+ * LINUX COLLECTOR: Crontabs
+ * ============================================================================ */
+
+static void collect_crontabs(void) {
+    const char* cron_dirs[] = {
+        "/var/spool/cron", "/var/spool/cron/crontabs",
+        "/etc/cron.d", NULL
+    };
+    for (int d = 0; cron_dirs[d]; d++) {
+        DIR* dir = opendir(cron_dirs[d]);
+        if (!dir) continue;
+        struct dirent* e;
+        while ((e = readdir(dir)) != NULL) {
+            if (e->d_name[0] == '.') continue;
+            char fp[MAX_PATH_LEN];
+            snprintf(fp, sizeof(fp), "%s/%s", cron_dirs[d], e->d_name);
+            struct stat st;
+            if (stat(fp, &st) == 0 && S_ISREG(st.st_mode))
+                scan_file(fp);
+        }
+        closedir(dir);
+    }
+    /* Also scan /etc/crontab */
+    struct stat st;
+    if (stat("/etc/crontab", &st) == 0) scan_file("/etc/crontab");
+}
+
+/* ============================================================================
+ * LINUX COLLECTOR: htpasswd file parser
+ * ============================================================================ */
+
+static void collect_htpasswd(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+    char ln[MAX_LINE];
+    int lnum = 0;
+    while (fgets(ln, sizeof(ln), f)) {
+        lnum++;
+        int len = strlen(ln);
+        while (len > 0 && (ln[len-1] == '\n' || ln[len-1] == '\r')) ln[--len] = '\0';
+        if (len < 3) continue;
+
+        /* Format: user:hash */
+        char* colon = strchr(ln, ':');
+        if (!colon || colon == ln) continue;
+        int ulen = colon - ln;
+        if (ulen >= 64) continue;
+
+        char user[64];
+        strncpy(user, ln, ulen); user[ulen] = '\0';
+        const char* hash = colon + 1;
+        int hlen = strlen(hash);
+        if (hlen < 4) continue;
+
+        /* Determine hash type */
+        const char* htype = "unknown_htpasswd";
+        int hc = -1;
+        if (strncmp(hash, "$apr1$", 6) == 0) { htype = "apr1"; hc = 1600; }
+        else if (strncmp(hash, "{SHA}", 5) == 0) { htype = "sha_apache"; hc = 101; }
+        else if (strncmp(hash, "$2y$", 4) == 0 || strncmp(hash, "$2a$", 4) == 0 || strncmp(hash, "$2b$", 4) == 0)
+            { htype = "bcrypt"; hc = 3200; }
+        else if (strncmp(hash, "$5$", 3) == 0) { htype = "sha256crypt"; hc = 7400; }
+        else if (strncmp(hash, "$6$", 3) == 0) { htype = "sha512crypt"; hc = 1800; }
+
+        char reason[128];
+        snprintf(reason, sizeof(reason), "htpasswd user: %s", user);
+        track_user_hash(user, htype, path);
+        add_finding(CAT_PASSWORD_HASH, htype, CONF_HIGH, path, lnum, 0,
+                   hash, hc, reason, NULL, NULL);
+    }
+    fclose(f);
+}
+
+#endif /* !_WIN32 */
+
+/* ============================================================================
+ * WINDOWS COLLECTORS
+ * ============================================================================ */
+
+#ifdef _WIN32
+
+/* ============================================================================
+ * WINDOWS COLLECTOR: Unattend.xml / sysprep.inf
+ * ============================================================================ */
+
+static void collect_unattend_xml(void) {
+    const char* paths[] = {
+        "C:\\Windows\\Panther\\Unattend.xml",
+        "C:\\Windows\\Panther\\unattend.xml",
+        "C:\\Windows\\Panther\\autounattend.xml",
+        "C:\\Windows\\System32\\sysprep\\Unattend.xml",
+        "C:\\Windows\\System32\\sysprep\\unattend.xml",
+        "C:\\Windows\\System32\\sysprep\\sysprep.inf",
+        NULL
+    };
+
+    for (int i = 0; paths[i]; i++) {
+        FILE* f = fopen(paths[i], "r");
+        if (!f) continue;
+
+        if (opt_verbose) fprintf(stderr, "[*] Scanning Unattend: %s\n", paths[i]);
+
+        char ln[MAX_LINE];
+        int lnum = 0;
+        int in_password_block = 0;
+        while (fgets(ln, sizeof(ln), f)) {
+            lnum++;
+            int len = strlen(ln);
+            while (len > 0 && (ln[len-1] == '\n' || ln[len-1] == '\r')) ln[--len] = '\0';
+
+            if (strcasestr_local(ln, "<Password>") || strcasestr_local(ln, "<AdministratorPassword>") ||
+                strcasestr_local(ln, "<AutoLogon>"))
+                in_password_block = 1;
+            if (strcasestr_local(ln, "</Password>") || strcasestr_local(ln, "</AdministratorPassword>") ||
+                strcasestr_local(ln, "</AutoLogon>"))
+                in_password_block = 0;
+
+            /* Extract <Value>base64</Value> */
+            const char* val_tag = strcasestr_local(ln, "<Value>");
+            if (val_tag && in_password_block) {
+                const char* val_start = val_tag + 7;
+                const char* val_end = strcasestr_local(val_start, "</Value>");
+                if (val_end && val_end > val_start) {
+                    int vlen = val_end - val_start;
+                    if (vlen > 2 && vlen < 500) {
+                        char val[512];
+                        strncpy(val, val_start, vlen); val[vlen] = '\0';
+                        add_finding(CAT_PLAINTEXT, "unattend_password", CONF_HIGH, paths[i], lnum, 0,
+                                   val, -1, "Unattend.xml password (base64)", NULL, NULL);
+                    }
+                }
+            }
+            /* Also check for plaintext password fields */
+            if (strcasestr_local(ln, "Password=") && !strcasestr_local(ln, "<!--")) {
+                const char* eq = strcasestr_local(ln, "Password=");
+                eq += 9;
+                while (*eq == ' ' || *eq == '"') eq++;
+                int vlen = 0;
+                while (eq[vlen] && eq[vlen] != '"' && eq[vlen] != '\r' && eq[vlen] != '\n' && vlen < 200) vlen++;
+                if (vlen > 2) {
+                    char val[256];
+                    strncpy(val, eq, vlen); val[vlen] = '\0';
+                    add_finding(CAT_PLAINTEXT, "unattend_password", CONF_HIGH, paths[i], lnum, 0,
+                               val, -1, "sysprep.inf password", NULL, NULL);
+                }
+            }
+        }
+        fclose(f);
+    }
+}
+
+/* ============================================================================
+ * WINDOWS COLLECTOR: GPP cpassword (Group Policy Preferences)
+ * ============================================================================ */
+
+static void scan_gpp_file(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+
+    if (opt_verbose) fprintf(stderr, "[*] Scanning GPP: %s\n", path);
+
+    char ln[MAX_LINE];
+    int lnum = 0;
+    while (fgets(ln, sizeof(ln), f)) {
+        lnum++;
+        const char* cp = strcasestr_local(ln, "cpassword=\"");
+        if (!cp) continue;
+        cp += 11;
+        int vlen = 0;
+        while (cp[vlen] && cp[vlen] != '"' && vlen < 500) vlen++;
+        if (vlen > 2) {
+            char val[512];
+            strncpy(val, cp, vlen); val[vlen] = '\0';
+
+            /* Also extract userName if present */
+            char user[64] = "";
+            const char* un = strcasestr_local(ln, "userName=\"");
+            if (un) {
+                un += 10;
+                int ulen = 0;
+                while (un[ulen] && un[ulen] != '"' && ulen < 63) ulen++;
+                strncpy(user, un, ulen); user[ulen] = '\0';
+            }
+
+            char reason[256];
+            if (user[0])
+                snprintf(reason, sizeof(reason), "GPP cpassword for user: %s (AES key is public - trivially decryptable)", user);
+            else
+                snprintf(reason, sizeof(reason), "GPP cpassword (AES key is public - trivially decryptable)");
+
+            if (user[0]) track_user_hash(user, "gpp_cpassword", path);
+            add_finding(CAT_PLAINTEXT, "gpp_cpassword", CONF_HIGH, path, lnum, 0,
+                       val, -1, reason, NULL, NULL);
+        }
+    }
+    fclose(f);
+}
+
+static void collect_gpp_xml(void) {
+    /* Search SYSVOL and common GPO paths */
+    const char* gpp_bases[] = {
+        "C:\\Windows\\SYSVOL",
+        "C:\\Windows\\SYSVOL\\domain\\Policies",
+        NULL
+    };
+    const char* gpp_files[] = {
+        "Groups.xml", "Services.xml", "ScheduledTasks.xml",
+        "DataSources.xml", "Drives.xml", "Printers.xml",
+        NULL
+    };
+
+    for (int b = 0; gpp_bases[b]; b++) {
+        for (int f = 0; gpp_files[f]; f++) {
+            char search_path[MAX_PATH_LEN];
+            snprintf(search_path, sizeof(search_path), "%s\\%s", gpp_bases[b], gpp_files[f]);
+            struct stat st;
+            if (stat(search_path, &st) == 0)
+                scan_gpp_file(search_path);
+        }
+    }
+}
+
+/* ============================================================================
+ * WINDOWS COLLECTOR: PowerShell History
+ * ============================================================================ */
+
+static void collect_powershell_history(void) {
+    char* appdata = getenv("APPDATA");
+    if (!appdata) return;
+
+    char path[MAX_PATH_LEN];
+    snprintf(path, sizeof(path), "%s\\Microsoft\\Windows\\PowerShell\\PSReadLine\\ConsoleHost_history.txt", appdata);
+
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+
+    if (opt_verbose) fprintf(stderr, "[*] Scanning PS history: %s\n", path);
+
+    char ln[MAX_LINE];
+    int lnum = 0;
+    while (fgets(ln, sizeof(ln), f)) {
+        lnum++;
+        int len = strlen(ln);
+        while (len > 0 && (ln[len-1] == '\n' || ln[len-1] == '\r')) ln[--len] = '\0';
+        if (len < 8) continue;
+
+        int found = 0;
+        /* PowerShell-specific credential patterns */
+        if (strcasestr_local(ln, "ConvertTo-SecureString")) found = 1;
+        else if (strcasestr_local(ln, "-Credential")) found = 1;
+        else if (strcasestr_local(ln, "Net.NetworkCredential")) found = 1;
+        else if (strcasestr_local(ln, "SecureString")) found = 1;
+        else if (strcasestr_local(ln, "password") && (strchr(ln, '=') || strchr(ln, ':'))) found = 1;
+        /* Also check generic history patterns */
+        for (int i = 0; !found && HISTORY_PATTERNS[i].pattern; i++) {
+            if (strcasestr_local(ln, HISTORY_PATTERNS[i].pattern)) found = 1;
+        }
+
+        if (found) {
+            add_finding(CAT_PLAINTEXT, "powershell_history", CONF_HIGH, path, lnum, 0,
+                       ln, -1, "Credential in PowerShell history", NULL, NULL);
+        }
+    }
+    fclose(f);
+}
+
+/* ============================================================================
+ * WINDOWS COLLECTOR: WiFi Profiles (keyMaterial)
+ * ============================================================================ */
+
+static void scan_wifi_profile(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+
+    char ln[MAX_LINE];
+    int lnum = 0;
+    char ssid[128] = "";
+    while (fgets(ln, sizeof(ln), f)) {
+        lnum++;
+        int len = strlen(ln);
+        while (len > 0 && (ln[len-1] == '\n' || ln[len-1] == '\r')) ln[--len] = '\0';
+
+        /* Extract SSID name */
+        const char* name_tag = strcasestr_local(ln, "<name>");
+        if (name_tag && !ssid[0]) {
+            const char* start = name_tag + 6;
+            const char* end = strcasestr_local(start, "</name>");
+            if (end && end > start && end - start < 127) {
+                strncpy(ssid, start, end - start);
+                ssid[end - start] = '\0';
+            }
+        }
+
+        const char* key_tag = strcasestr_local(ln, "<keyMaterial>");
+        if (key_tag) {
+            const char* start = key_tag + 13;
+            const char* end = strcasestr_local(start, "</keyMaterial>");
+            if (end && end > start) {
+                int vlen = end - start;
+                if (vlen > 2 && vlen < 200) {
+                    char val[256];
+                    strncpy(val, start, vlen); val[vlen] = '\0';
+                    char reason[256];
+                    snprintf(reason, sizeof(reason), "WiFi key for SSID: %s", ssid[0] ? ssid : "(unknown)");
+                    add_finding(CAT_PLAINTEXT, "wifi_key", CONF_HIGH, path, lnum, 0,
+                               val, -1, reason, NULL, NULL);
+                }
+            }
+        }
+    }
+    fclose(f);
+}
+
+static void collect_wifi_profiles(void) {
+    char* programdata = getenv("ProgramData");
+    if (!programdata) return;
+
+    char base[MAX_PATH_LEN];
+    snprintf(base, sizeof(base), "%s\\Microsoft\\Wlansvc\\Profiles\\Interfaces", programdata);
+
+    DIR* ifaces = opendir(base);
+    if (!ifaces) return;
+
+    struct dirent* iface_e;
+    while ((iface_e = readdir(ifaces)) != NULL) {
+        if (iface_e->d_name[0] == '.') continue;
+        char iface_dir[MAX_PATH_LEN];
+        snprintf(iface_dir, sizeof(iface_dir), "%s\\%s", base, iface_e->d_name);
+
+        DIR* profiles = opendir(iface_dir);
+        if (!profiles) continue;
+        struct dirent* prof_e;
+        while ((prof_e = readdir(profiles)) != NULL) {
+            if (prof_e->d_name[0] == '.') continue;
+            const char* ext = strrchr(prof_e->d_name, '.');
+            if (!ext || strcasecmp(ext, ".xml") != 0) continue;
+            char prof_path[MAX_PATH_LEN];
+            snprintf(prof_path, sizeof(prof_path), "%s\\%s", iface_dir, prof_e->d_name);
+            scan_wifi_profile(prof_path);
+        }
+        closedir(profiles);
+    }
+    closedir(ifaces);
+}
+
+/* ============================================================================
+ * WINDOWS COLLECTOR: Credential Manager & DPAPI artifacts
+ * ============================================================================ */
+
+static void collect_credential_manager(void) {
+    const char* env_vars[] = {"APPDATA", "LOCALAPPDATA", NULL};
+    for (int e = 0; env_vars[e]; e++) {
+        char* base = getenv(env_vars[e]);
+        if (!base) continue;
+        char path[MAX_PATH_LEN];
+        snprintf(path, sizeof(path), "%s\\Microsoft\\Credentials", base);
+
+        DIR* dir = opendir(path);
+        if (!dir) continue;
+
+        struct dirent* de;
+        int count = 0;
+        while ((de = readdir(dir)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            count++;
+        }
+        closedir(dir);
+
+        if (count > 0) {
+            char reason[256];
+            snprintf(reason, sizeof(reason), "%d DPAPI credential blob(s) found", count);
+            add_finding(CAT_TOKEN, "dpapi_credential", CONF_MEDIUM, path, 0, 0,
+                       "[DPAPI Protected Credentials]", -1, reason, NULL, NULL);
+        }
+    }
+
+    /* Check for DPAPI master keys */
+    char* appdata = getenv("APPDATA");
+    if (appdata) {
+        char mk_path[MAX_PATH_LEN];
+        snprintf(mk_path, sizeof(mk_path), "%s\\Microsoft\\Protect", appdata);
+        struct stat st;
+        if (stat(mk_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            add_finding(CAT_TOKEN, "dpapi_masterkey", CONF_MEDIUM, mk_path, 0, 0,
+                       "[DPAPI Master Keys]", -1, "DPAPI master key directory", NULL, NULL);
+        }
+    }
+}
+
+/* ============================================================================
+ * WINDOWS COLLECTOR: Registry AutoLogon (.reg file scanner)
+ * ============================================================================ */
+
+static void scan_reg_file(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+    char ln[MAX_LINE];
+    int lnum = 0;
+    while (fgets(ln, sizeof(ln), f)) {
+        lnum++;
+        if (strcasestr_local(ln, "DefaultPassword") || strcasestr_local(ln, "AutoAdminLogon")) {
+            add_finding(CAT_PLAINTEXT, "registry_autologon", CONF_HIGH, path, lnum, 0,
+                       ln, -1, "Windows AutoLogon credential", NULL, NULL);
+        }
+        if (strcasestr_local(ln, "VNCPassword") || strcasestr_local(ln, "Password") ||
+            strcasestr_local(ln, "ProxyPassword")) {
+            if (strchr(ln, '=') || strchr(ln, ':')) {
+                add_finding(CAT_PLAINTEXT, "registry_password", CONF_MEDIUM, path, lnum, 0,
+                           ln, -1, "Registry password entry", NULL, NULL);
+            }
+        }
+    }
+    fclose(f);
+}
+
+#endif /* _WIN32 */
+
+/* ============================================================================
+ * CROSS-PLATFORM: KeePass / RDP / Bitlocker detection
+ * ============================================================================ */
+
+static void detect_keepass_db(const char* path) {
+    add_finding(CAT_TOKEN, "keepass_database", CONF_HIGH, path, 0, 0,
+               "[KeePass Database]", 13400, "KeePass .kdbx (hashcat -m 13400)", NULL, NULL);
+}
+
+static void detect_rdp_file(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+    char ln[MAX_LINE];
+    int lnum = 0;
+    while (fgets(ln, sizeof(ln), f)) {
+        lnum++;
+        /* RDP password format: password 51:b:base64data */
+        if (strncasecmp(ln, "password 51:b:", 14) == 0) {
+            const char* b64 = ln + 14;
+            int blen = strlen(b64);
+            while (blen > 0 && (b64[blen-1] == '\n' || b64[blen-1] == '\r')) blen--;
+            if (blen > 4) {
+                char val[512];
+                strncpy(val, b64, blen < 511 ? blen : 511);
+                val[blen < 511 ? blen : 511] = '\0';
+                add_finding(CAT_PLAINTEXT, "rdp_password", CONF_HIGH, path, lnum, 0,
+                           val, -1, "RDP saved password (DPAPI encrypted)", NULL, NULL);
+            }
+        }
+    }
+    fclose(f);
+}
 
 /* ============================================================================
  * OUTPUT
@@ -1990,11 +3156,11 @@ static void print_report(void) {
     
     if (result.count == 0) { printf("  [!] No findings\n"); return; }
     
-    int cc[5] = {0};
+    int cc[6] = {0};
     for (int i = 0; i < result.count; i++) cc[result.findings[i].category]++;
-    Category cats[] = {CAT_PASSWORD_HASH, CAT_POSSIBLE_HASH, CAT_PLAINTEXT, CAT_TOKEN, CAT_PRIVATE_KEY};
-    
-    for (int c = 0; c < 5; c++) {
+    Category cats[] = {CAT_PASSWORD_HASH, CAT_NETWORK_AUTH, CAT_POSSIBLE_HASH, CAT_PLAINTEXT, CAT_TOKEN, CAT_PRIVATE_KEY};
+
+    for (int c = 0; c < 6; c++) {
         if (cc[cats[c]] == 0) continue;
         printf("══════════════════════════════════════════════════════════════════════\n");
         printf("  [%s] - %d\n", cat_str(cats[c]), cc[cats[c]]);
@@ -2080,10 +3246,12 @@ static void print_report(void) {
         printf("══════════════════════════════════════════════════════════════════════\n\n");
         
         /* Group by hashcat mode */
-        int modes_seen[20000] = {0};
+        #define MAX_HASHCAT_MODE 30000
+        int* modes_seen = calloc(MAX_HASHCAT_MODE, sizeof(int));
+        if (!modes_seen) { fprintf(stderr, "[!] Out of memory for hashcat report\n"); return; }
         for (int i = 0; i < result.count; i++) {
             Finding* f = &result.findings[i];
-            if (f->hashcat_mode > 0 && f->hashcat_mode < 20000 && !modes_seen[f->hashcat_mode]) {
+            if (f->hashcat_mode > 0 && f->hashcat_mode < MAX_HASHCAT_MODE && !modes_seen[f->hashcat_mode]) {
                 modes_seen[f->hashcat_mode] = 1;
                 
                 const char* mode_name = f->hash_type;
@@ -2114,8 +3282,35 @@ static void print_report(void) {
                 break;
             }
         }
+        free(modes_seen);
     }
-    
+
+    /* User Registry Report */
+    int reg_count = 0;
+    for (int i = 0; i < USER_REGISTRY_SIZE; i++)
+        for (UserRegEntry* e = user_registry[i]; e; e = e->next)
+            if (e->has_password || e->credential_count > 0) reg_count++;
+
+    if (reg_count > 0) {
+        printf("══════════════════════════════════════════════════════════════════════\n");
+        printf("  [USER REGISTRY] - %d users with credentials\n", reg_count);
+        printf("══════════════════════════════════════════════════════════════════════\n\n");
+        printf("  %-16s %-6s %-24s %-16s %s\n", "User", "UID", "Home", "Shell", "Creds");
+        printf("  %-16s %-6s %-24s %-16s %s\n", "────────────────", "──────", "────────────────────────", "────────────────", "─────");
+        for (int i = 0; i < USER_REGISTRY_SIZE; i++) {
+            for (UserRegEntry* e = user_registry[i]; e; e = e->next) {
+                if (e->has_password || e->credential_count > 0) {
+                    printf("  %-16s %-6d %-24.24s %-16.16s %d\n",
+                           e->username, e->uid,
+                           e->home_dir[0] ? e->home_dir : "-",
+                           e->shell[0] ? e->shell : "-",
+                           e->credential_count);
+                }
+            }
+        }
+        printf("\n");
+    }
+
     printf("══════════════════════════════════════════════════════════════════════\n");
     printf("  SUMMARY: ");
     int h=0,m=0,l=0;
@@ -2130,15 +3325,17 @@ static void print_json(void) {
             result.files_scanned, result.duplicates_suppressed, result.count);
     for (int i = 0; i < result.count; i++) {
         Finding* f = &result.findings[i];
-        char ep[MAX_PATH_LEN*2], ev[1024], er[512], ecb[MAX_CONTEXT*2], eca[MAX_CONTEXT*2];
+        char ep[MAX_PATH_LEN*2], ev[1024], er[512], eo[128], eht[128], ecb[MAX_CONTEXT*2], eca[MAX_CONTEXT*2];
         json_escape(f->file_path, ep, sizeof(ep));
         json_escape(opt_show_values ? f->value_full : f->value_preview, ev, sizeof(ev));
         json_escape(f->reason, er, sizeof(er));
+        json_escape(f->owner, eo, sizeof(eo));
+        json_escape(f->hash_type, eht, sizeof(eht));
         json_escape(f->context_before, ecb, sizeof(ecb));
         json_escape(f->context_after, eca, sizeof(eca));
-        fprintf(out, "    {\"category\":\"%s\",\"hash_type\":\"%s\",\"confidence\":\"%s\",", cat_str(f->category), f->hash_type, conf_str(f->confidence));
+        fprintf(out, "    {\"category\":\"%s\",\"hash_type\":\"%s\",\"confidence\":\"%s\",", cat_str(f->category), eht, conf_str(f->confidence));
         fprintf(out, "\"file_path\":\"%s\",\"line\":%d,\"value\":\"%s\",\"len\":%d,", ep, f->line_number, ev, f->value_length);
-        fprintf(out, "\"occurrences\":%d,\"hashcat\":%d,\"owner\":\"%s\",\"reason\":\"%s\",", f->occurrence_count, f->hashcat_mode, f->owner, er);
+        fprintf(out, "\"occurrences\":%d,\"hashcat\":%d,\"owner\":\"%s\",\"reason\":\"%s\",", f->occurrence_count, f->hashcat_mode, eo, er);
         fprintf(out, "\"context_before\":\"%s\",\"context_after\":\"%s\"}", ecb, eca);
         fprintf(out, "%s\n", i < result.count - 1 ? "," : "");
     }
@@ -2150,41 +3347,90 @@ static void print_json(void) {
  * ============================================================================ */
 
 static void run_profile(const char* p) {
+    /* ---- Platform-specific collectors (run once before scanning) ---- */
 #ifndef _WIN32
     collect_shadow();
+    collect_passwd();
 #endif
+#ifdef _WIN32
+    collect_unattend_xml();
+    collect_gpp_xml();
+    collect_powershell_history();
+    collect_wifi_profiles();
+    collect_credential_manager();
+#endif
+
+    /* ---- Web directories ---- */
     const char* web[] = {
 #ifdef _WIN32
-        "C:\\inetpub\\wwwroot","C:\\xampp\\htdocs","C:\\wamp\\www",NULL
+        "C:\\inetpub\\wwwroot", "C:\\xampp\\htdocs", "C:\\wamp\\www", NULL
 #else
-        "/var/www","/srv/www","/srv","/opt",NULL
+        "/var/www", "/srv/www", "/srv", "/opt", NULL
 #endif
     };
-    if (strcmp(p,"quick")==0||strcmp(p,"htb")==0||strcmp(p,"web")==0)
-        for (int i=0;web[i];i++) { struct stat st; if (stat(web[i],&st)==0) { if(opt_verbose)fprintf(stderr,"[*] %s\n",web[i]); scan_dir(web[i],0); } }
-    if (strcmp(p,"quick")==0||strcmp(p,"htb")==0) {
+    if (strcmp(p, "quick") == 0 || strcmp(p, "htb") == 0 || strcmp(p, "web") == 0)
+        for (int i = 0; web[i]; i++) { struct stat st; if (stat(web[i], &st) == 0) { if (opt_verbose) fprintf(stderr, "[*] %s\n", web[i]); scan_dir(web[i], 0); } }
+
+    /* ---- Home/User directories ---- */
+    if (strcmp(p, "quick") == 0 || strcmp(p, "htb") == 0) {
 #ifdef _WIN32
-        char* up=getenv("USERPROFILE"); if(up){if(opt_verbose)fprintf(stderr,"[*] %s\n",up);scan_dir(up,0);}
+        char* up = getenv("USERPROFILE");
+        if (up) { if (opt_verbose) fprintf(stderr, "[*] %s\n", up); scan_dir(up, 0); }
+        /* Windows-specific paths */
+        char* appdata = getenv("APPDATA");
+        char* programdata = getenv("ProgramData");
+        if (appdata) scan_dir(appdata, 0);
+        /* IIS config */
+        { struct stat st; if (stat("C:\\Windows\\System32\\inetsrv\\config", &st) == 0) scan_dir("C:\\Windows\\System32\\inetsrv\\config", 0); }
+        /* Scheduled tasks */
+        { struct stat st; if (stat("C:\\Windows\\System32\\Tasks", &st) == 0) scan_dir("C:\\Windows\\System32\\Tasks", 0); }
+        /* Panther (unattend files) */
+        { struct stat st; if (stat("C:\\Windows\\Panther", &st) == 0) scan_dir("C:\\Windows\\Panther", 0); }
+        { struct stat st; if (stat("C:\\Windows\\System32\\sysprep", &st) == 0) scan_dir("C:\\Windows\\System32\\sysprep", 0); }
 #else
-        char* h=getenv("HOME"); if(h){if(opt_verbose)fprintf(stderr,"[*] %s\n",h);scan_dir(h,0);}
-        scan_dir("/home",0); scan_dir("/root",0);
+        char* h = getenv("HOME");
+        if (h) { if (opt_verbose) fprintf(stderr, "[*] %s\n", h); scan_dir(h, 0); }
+        scan_dir("/home", 0);
+        scan_dir("/root", 0);
         /* Cloud config locations */
-        scan_dir("/root/.aws",0);
-        scan_dir("/root/.kube",0);
-        scan_dir("/root/.docker",0);
+        scan_dir("/root/.aws", 0);
+        scan_dir("/root/.kube", 0);
+        scan_dir("/root/.docker", 0);
 #endif
     }
-    if (strcmp(p,"htb")==0||strcmp(p,"full")==0) {
+
+    /* ---- Extended paths for htb/full ---- */
+    if (strcmp(p, "htb") == 0 || strcmp(p, "full") == 0) {
 #ifndef _WIN32
-        const char* ex[]={"/etc","/var/backups","/var/log","/tmp",NULL};
-        for(int i=0;ex[i];i++){if(opt_verbose)fprintf(stderr,"[*] %s\n",ex[i]);scan_dir(ex[i],0);}
+        const char* ex[] = {
+            "/etc", "/var/backups", "/var/log", "/tmp",
+            /* Additional Linux paths */
+            "/var/spool/cron", "/var/spool/cron/crontabs",
+            "/etc/NetworkManager/system-connections",
+            "/etc/security",
+            NULL
+        };
+        for (int i = 0; ex[i]; i++) {
+            struct stat st;
+            if (stat(ex[i], &st) == 0) {
+                if (opt_verbose) fprintf(stderr, "[*] %s\n", ex[i]);
+                scan_dir(ex[i], 0);
+            }
+        }
+        /* Linux-specific collectors */
+        collect_networkmanager();
+        collect_opasswd();
+        collect_crontabs();
+        collect_proc_environ();
 #endif
     }
-    if (strcmp(p,"full")==0) {
+
+    /* ---- Full filesystem scan ---- */
+    if (strcmp(p, "full") == 0) {
 #ifdef _WIN32
-        scan_dir("C:\\",0);
+        scan_dir("C:\\", 0);
 #else
-        scan_dir("/",0);
+        scan_dir("/", 0);
 #endif
     }
 }
@@ -2405,6 +3651,7 @@ static void usage(const char* p) {
     printf("  --json            JSON output\n");
     printf("  -o <file>         Output file\n");
     printf("  -v, --verbose     Verbose mode\n");
+    printf("  -q, --quiet       Suppress banner and status output\n");
     printf("  --max-files <n>   Max files (default: 50000)\n");
     printf("  --timeout <s>     Max runtime seconds\n");
     printf("  --no-collectors   Disable archive/sqlite/git collectors\n");
@@ -2417,9 +3664,30 @@ static void usage(const char* p) {
     printf("  - Archive: unzip, tar (extracts ZIP/TAR/GZ/BZ2)\n");
     printf("  - SQLite:  sqlite3 or strings fallback\n");
     printf("  - Git:     git log -p for history secrets\n");
+    printf("\nLinux collectors:\n");
+    printf("  /etc/passwd, /etc/shadow, htpasswd, shell history,\n");
+    printf("  NetworkManager WiFi, opasswd, /proc/environ, crontabs\n");
+    printf("\nWindows collectors:\n");
+    printf("  Unattend.xml, GPP cpassword, PowerShell history,\n");
+    printf("  WiFi profiles, Credential Manager, .rdp/.kdbx detection\n");
+    printf("\nPatterns: 60+ hashes, 70+ credentials, 25+ tokens, pwdump,\n");
+    printf("  GPP, BitLocker, WPA PMKID, LM/NTLM standalone\n");
+}
+
+static void signal_handler(int sig) {
+    cleanup_temp_dir();
+    _exit(128 + sig);
 }
 
 int main(int argc, char* argv[]) {
+    /* Register cleanup for temp files on exit/signal */
+    atexit(cleanup_temp_dir);
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+#ifndef _WIN32
+    signal(SIGHUP, signal_handler);
+#endif
+
     memset(&result, 0, sizeof(result));
     result.start_time = time(NULL);
     result.capacity = 1000;
@@ -2440,6 +3708,7 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i],"--show-values")==0) opt_show_values=1;
         else if (strcmp(argv[i],"--json")==0) opt_json=1;
         else if (strcmp(argv[i],"-v")==0||strcmp(argv[i],"--verbose")==0) opt_verbose=1;
+        else if (strcmp(argv[i],"-q")==0||strcmp(argv[i],"--quiet")==0) opt_quiet=1;
         else if (strcmp(argv[i],"--no-collectors")==0) opt_collectors=0;
         else if (strcmp(argv[i],"--hashcat")==0) opt_hashcat_mode=1;
         else if (strcmp(argv[i],"--no-correlation")==0) opt_correlation=0;
@@ -2454,23 +3723,26 @@ int main(int argc, char* argv[]) {
     
     if (outfile) { json_file = fopen(outfile, "w"); if (!json_file) { fprintf(stderr, "Error: %s\n", outfile); return 1; } opt_json = 1; }
     
-    banner();
-    
+    if (!opt_quiet) banner();
+
     /* Detect available tools */
     if (opt_collectors) {
         detect_tools();
-        fprintf(stderr, "[*] Collectors: archive=%s sqlite=%s git=%s\n",
-                (has_tar || has_unzip) ? "yes" : "no",
-                (has_sqlite3 || has_strings) ? "yes" : "no",
-                has_git ? "yes" : "no");
+        if (!opt_quiet)
+            fprintf(stderr, "[*] Collectors: archive=%s sqlite=%s git=%s\n",
+                    (has_tar || has_unzip) ? "yes" : "no",
+                    (has_sqlite3 || has_strings) ? "yes" : "no",
+                    has_git ? "yes" : "no");
     } else {
-        fprintf(stderr, "[*] Collectors: disabled\n");
+        if (!opt_quiet) fprintf(stderr, "[*] Collectors: disabled\n");
     }
-    
-    fprintf(stderr, "[*] Mode: %s | Context: %d | Max: %d files\n", opt_wide?"wide":"strict", opt_context_lines, opt_max_files);
-    if (profile) fprintf(stderr, "[*] Profile: %s\n", profile);
-    if (opt_pcredz_file) fprintf(stderr, "[*] Pcredz mode: %s\n", opt_pcredz_file);
-    fprintf(stderr, "\n");
+
+    if (!opt_quiet) {
+        fprintf(stderr, "[*] Mode: %s | Context: %d | Max: %d files\n", opt_wide?"wide":"strict", opt_context_lines, opt_max_files);
+        if (profile) fprintf(stderr, "[*] Profile: %s\n", profile);
+        if (opt_pcredz_file) fprintf(stderr, "[*] Pcredz mode: %s\n", opt_pcredz_file);
+        fprintf(stderr, "\n");
+    }
     
     /* Pcredz direct parsing mode - skip normal scanning */
     if (opt_pcredz_file) {
@@ -2487,11 +3759,19 @@ int main(int argc, char* argv[]) {
     else if (pathc > 0) {
 #ifndef _WIN32
         collect_shadow();
+        collect_passwd();
+#endif
+#ifdef _WIN32
+        collect_unattend_xml();
+        collect_gpp_xml();
+        collect_powershell_history();
+        collect_wifi_profiles();
+        collect_credential_manager();
 #endif
         for (int i = 0; i < pathc; i++) {
             struct stat st;
             if (stat(paths[i], &st) == 0) {
-                fprintf(stderr, "[*] %s\n", paths[i]);
+                if (!opt_quiet) fprintf(stderr, "[*] %s\n", paths[i]);
                 if (S_ISDIR(st.st_mode)) {
                     scan_dir(paths[i], 0);
                 } else if (S_ISREG(st.st_mode)) {
@@ -2504,11 +3784,17 @@ int main(int argc, char* argv[]) {
     } else {
 #ifndef _WIN32
         collect_shadow();
+        collect_passwd();
 #endif
 #ifdef _WIN32
-        char* up = getenv("USERPROFILE"); if (up) { fprintf(stderr, "[*] %s\n", up); scan_dir(up, 0); }
+        collect_unattend_xml();
+        collect_gpp_xml();
+        collect_powershell_history();
+        collect_wifi_profiles();
+        collect_credential_manager();
+        char* up = getenv("USERPROFILE"); if (up) { if (!opt_quiet) fprintf(stderr, "[*] %s\n", up); scan_dir(up, 0); }
 #else
-        char* h = getenv("HOME"); if (h) { fprintf(stderr, "[*] %s\n", h); scan_dir(h, 0); }
+        char* h = getenv("HOME"); if (h) { if (!opt_quiet) fprintf(stderr, "[*] %s\n", h); scan_dir(h, 0); }
 #endif
     }
     
