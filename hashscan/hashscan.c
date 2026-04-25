@@ -58,11 +58,14 @@
 #else
     #include <unistd.h>
     #include <pwd.h>
+    #include <pthread.h>
+    #include <sys/mman.h>
+    #include <fcntl.h>
     #define PATH_SEP '/'
     #define IS_WINDOWS 0
 #endif
 
-#define VERSION "11.0"
+#define VERSION "11.2"
 #define MAX_LINE 16384
 #define MAX_PATH_LEN 4096
 #define MAX_CONTEXT 512
@@ -132,11 +135,219 @@ static ScanResult result;
 static DedupeEntry* dedup_table[HASH_TABLE_SIZE];
 static InodeEntry* inode_table[HASH_TABLE_SIZE];
 static int opt_wide = 0, opt_show_values = 0, opt_json = 0, opt_verbose = 0, opt_quiet = 0, opt_context_lines = 1;
+static int opt_threads = 1;  /* 1 = single-threaded (default, safest); >1 = use worker pool */
 static int opt_max_files = 50000, opt_max_runtime = 0;
 static long opt_max_file_size = 20 * 1024 * 1024;
 static FILE* json_file = NULL;
-static char* line_buffer[5];
-static int line_buffer_idx = 0;
+/* Per-scan_file context buffer — was global (line_buffer/line_buffer_idx),
+ * now stack-local in scan_file to support threading. */
+
+/* ============================================================================
+ * THREADING ABSTRACTION (pthread on POSIX, Win32 on Windows)
+ * ============================================================================ */
+#ifdef _WIN32
+    typedef HANDLE thread_t;
+    typedef CRITICAL_SECTION mutex_t;
+    #define MUTEX_INIT(m)    InitializeCriticalSection(m)
+    #define MUTEX_DESTROY(m) DeleteCriticalSection(m)
+    #define MUTEX_LOCK(m)    EnterCriticalSection(m)
+    #define MUTEX_UNLOCK(m)  LeaveCriticalSection(m)
+    #define ATOMIC_INC(p)    InterlockedIncrement((long*)(p))
+    static int thread_create(thread_t* t, LPTHREAD_START_ROUTINE fn, void* arg) {
+        *t = CreateThread(NULL, 0, fn, arg, 0, NULL);
+        return *t == NULL ? -1 : 0;
+    }
+    static void thread_join(thread_t t) { WaitForSingleObject(t, INFINITE); CloseHandle(t); }
+#else
+    typedef pthread_t thread_t;
+    typedef pthread_mutex_t mutex_t;
+    #define MUTEX_INIT(m)    pthread_mutex_init(m, NULL)
+    #define MUTEX_DESTROY(m) pthread_mutex_destroy(m)
+    #define MUTEX_LOCK(m)    pthread_mutex_lock(m)
+    #define MUTEX_UNLOCK(m)  pthread_mutex_unlock(m)
+    #define ATOMIC_INC(p)    __atomic_add_fetch((p), 1, __ATOMIC_RELAXED)
+    static int thread_create(thread_t* t, void* (*fn)(void*), void* arg) {
+        return pthread_create(t, NULL, fn, arg);
+    }
+    static void thread_join(thread_t t) { pthread_join(t, NULL); }
+#endif
+
+static mutex_t g_findings_lock;
+static mutex_t g_tables_lock;
+static mutex_t g_queue_lock;
+static int g_locks_init = 0;
+
+static void init_locks(void) {
+    if (g_locks_init) return;
+    MUTEX_INIT(&g_findings_lock);
+    MUTEX_INIT(&g_tables_lock);
+    MUTEX_INIT(&g_queue_lock);
+    g_locks_init = 1;
+}
+
+/* ============================================================================
+ * MMAP READER (fallback to malloc+fread)
+ * ============================================================================ */
+typedef struct {
+    unsigned char* data;
+    size_t size;
+    int via_mmap;       /* 1 = mmap, 0 = malloc */
+#ifdef _WIN32
+    HANDLE hFile;
+    HANDLE hMap;
+#endif
+} FileBuf;
+
+static int read_file(const char* path, long max_size, FileBuf* out) {
+    memset(out, 0, sizeof(*out));
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    if (st.st_size > max_size) return -2;
+    if (st.st_size == 0) {
+        out->data = (unsigned char*)calloc(1, 1);
+        return out->data ? 0 : -1;
+    }
+
+    /* mmap path: files larger than 1 MB */
+#ifdef _WIN32
+    if (st.st_size >= 1024 * 1024) {
+        out->hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (out->hFile != INVALID_HANDLE_VALUE) {
+            out->hMap = CreateFileMappingA(out->hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+            if (out->hMap) {
+                void* p = MapViewOfFile(out->hMap, FILE_MAP_READ, 0, 0, 0);
+                if (p) {
+                    out->data = (unsigned char*)p;
+                    out->size = (size_t)st.st_size;
+                    out->via_mmap = 1;
+                    return 0;
+                }
+                CloseHandle(out->hMap); out->hMap = NULL;
+            }
+            CloseHandle(out->hFile); out->hFile = INVALID_HANDLE_VALUE;
+        }
+        /* fall through to fread */
+    }
+#else
+    if (st.st_size >= 1024 * 1024) {
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            void* p = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            close(fd);
+            if (p != MAP_FAILED) {
+                out->data = (unsigned char*)p;
+                out->size = (size_t)st.st_size;
+                out->via_mmap = 1;
+                return 0;
+            }
+        }
+        /* fall through to fread */
+    }
+#endif
+
+    /* Fallback: malloc + fread */
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    out->data = (unsigned char*)malloc(st.st_size + 1);
+    if (!out->data) { fclose(f); return -1; }
+    size_t rd = fread(out->data, 1, st.st_size, f);
+    out->data[rd] = '\0';
+    out->size = rd;
+    fclose(f);
+    return 0;
+}
+
+static void release_file(FileBuf* fb) {
+    if (!fb || !fb->data) return;
+    if (fb->via_mmap) {
+#ifdef _WIN32
+        UnmapViewOfFile(fb->data);
+        if (fb->hMap) CloseHandle(fb->hMap);
+        if (fb->hFile != INVALID_HANDLE_VALUE) CloseHandle(fb->hFile);
+#else
+        munmap(fb->data, fb->size);
+#endif
+    } else {
+        free(fb->data);
+    }
+    fb->data = NULL;
+}
+
+/* ============================================================================
+ * WORK QUEUE for threaded scanning
+ * ============================================================================ */
+#define MAX_QUEUE 200000
+typedef struct {
+    char* paths[MAX_QUEUE];
+    int head;
+    int tail;
+    int closed;
+} WorkQueue;
+
+static WorkQueue g_queue = { {0}, 0, 0, 0 };
+
+static void queue_push(const char* path) {
+    MUTEX_LOCK(&g_queue_lock);
+    if (g_queue.tail < MAX_QUEUE) {
+        g_queue.paths[g_queue.tail++] = strdup(path);
+    }
+    MUTEX_UNLOCK(&g_queue_lock);
+}
+
+static char* queue_pop(void) {
+    MUTEX_LOCK(&g_queue_lock);
+    char* p = NULL;
+    if (g_queue.head < g_queue.tail) {
+        p = g_queue.paths[g_queue.head++];
+    }
+    MUTEX_UNLOCK(&g_queue_lock);
+    return p;
+}
+
+static void queue_close(void) {
+    MUTEX_LOCK(&g_queue_lock);
+    g_queue.closed = 1;
+    MUTEX_UNLOCK(&g_queue_lock);
+}
+
+static int queue_is_done(void) {
+    MUTEX_LOCK(&g_queue_lock);
+    int done = g_queue.closed && g_queue.head >= g_queue.tail;
+    MUTEX_UNLOCK(&g_queue_lock);
+    return done;
+}
+
+/* Forward decl for scan_file */
+static void scan_file(const char* path);
+
+#ifdef _WIN32
+static DWORD WINAPI worker_thread(LPVOID arg) {
+    (void)arg;
+    while (!queue_is_done()) {
+        char* p = queue_pop();
+        if (!p) { Sleep(1); continue; }
+        scan_file(p);
+        free(p);
+    }
+    return 0;
+}
+#else
+static void* worker_thread(void* arg) {
+    (void)arg;
+    while (!queue_is_done()) {
+        char* p = queue_pop();
+        if (!p) {
+            struct timespec ts = {0, 1000000};  /* 1ms */
+            nanosleep(&ts, NULL);
+            continue;
+        }
+        scan_file(p);
+        free(p);
+    }
+    return NULL;
+}
+#endif
 
 /* ============================================================================
  * USER-HASH CORRELATION & REUSE DETECTION
@@ -645,6 +856,41 @@ static const char* strcasestr_local(const char* haystack, const char* needle) {
 static int is_hex(char c) { return (c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F'); }
 static void str_lower(char* s) { while (*s) { *s = tolower(*s); s++; } }
 
+/* Minimal base64 decoder (RFC 4648 + URL-safe). Returns decoded length or -1. */
+static int b64_decode(const char* in, int inlen, unsigned char* out, int outsz) {
+    int oi = 0, val = 0, bits = 0;
+    for (int i = 0; i < inlen; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '=' || c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
+        int v;
+        if (c >= 'A' && c <= 'Z') v = c - 'A';
+        else if (c >= 'a' && c <= 'z') v = c - 'a' + 26;
+        else if (c >= '0' && c <= '9') v = c - '0' + 52;
+        else if (c == '+' || c == '-') v = 62;
+        else if (c == '/' || c == '_') v = 63;
+        else return -1;
+        val = (val << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (oi >= outsz - 1) return -1;
+            out[oi++] = (val >> bits) & 0xFF;
+        }
+    }
+    out[oi] = '\0';
+    return oi;
+}
+
+/* Heuristic: is decoded byte sequence printable text? */
+static int looks_like_text(const unsigned char* buf, int len) {
+    if (len < 4) return 0;
+    int printable = 0;
+    for (int i = 0; i < len; i++) {
+        if ((buf[i] >= 0x20 && buf[i] < 0x7f) || buf[i] == '\t') printable++;
+    }
+    return (printable * 100) / len >= 90;
+}
+
 static void json_escape(const char* src, char* dst, int sz) {
     int di = 0;
     for (int si = 0; src[si] && di < sz - 6; si++) {
@@ -1148,10 +1394,16 @@ static int ensure_cap(void) {
 static void add_finding(Category cat, const char* type, Confidence conf, const char* path,
                        int line, long off, const char* val, int hc, const char* reason,
                        const char* ctx_b, const char* ctx_a) {
+    if (g_locks_init) MUTEX_LOCK(&g_findings_lock);
     uint32_t vh = fnv1a(val);
     int dup = check_dup(vh);
-    if (dup >= 0) { result.findings[dup].occurrence_count++; result.duplicates_suppressed++; return; }
-    if (!ensure_cap()) return;
+    if (dup >= 0) {
+        result.findings[dup].occurrence_count++;
+        result.duplicates_suppressed++;
+        if (g_locks_init) MUTEX_UNLOCK(&g_findings_lock);
+        return;
+    }
+    if (!ensure_cap()) { if (g_locks_init) MUTEX_UNLOCK(&g_findings_lock); return; }
     
     Finding* f = &result.findings[result.count];
     memset(f, 0, sizeof(Finding));
@@ -1198,9 +1450,10 @@ static void add_finding(Category cat, const char* type, Confidence conf, const c
     
     add_dup(vh, result.count);
     result.count++;
-    
+
     if (opt_verbose) fprintf(stderr, "[+] %s: %s in %s:%d\n",
         cat==CAT_PASSWORD_HASH?"HASH":cat==CAT_POSSIBLE_HASH?"POSSIBLE":cat==CAT_NETWORK_AUTH?"NETAUTH":"FOUND", type, path, line);
+    if (g_locks_init) MUTEX_UNLOCK(&g_findings_lock);
 }
 
 /* ============================================================================
@@ -1717,6 +1970,32 @@ static void scan_line(const char* line, const char* path, int lnum, long off, co
         }
     }
     
+    /* GitHub Actions / GitLab CI secret references — flags use, not value */
+    {
+        const char* gh = strstr(line, "${{");
+        while (gh) {
+            const char* end = strstr(gh, "}}");
+            if (!end || end - gh > 200) break;
+            int slen = end - gh + 2;
+            if (strstr(gh, "secrets.") || strstr(gh, "vars.")) {
+                char gv[256];
+                int cp = slen < 250 ? slen : 250;
+                strncpy(gv, gh, cp); gv[cp] = '\0';
+                add_finding(CAT_PLAINTEXT, "ci_secret_reference", CONF_LOW,
+                           path, lnum, off, gv, -1,
+                           "CI/CD secret reference (check pipeline logs for actual value)", cb, ca);
+            }
+            gh = strstr(end, "${{");
+        }
+        /* GitLab predefined secret vars: $CI_REGISTRY_PASSWORD, $CI_JOB_TOKEN */
+        const char* gl = strstr(line, "$CI_");
+        if (gl && (strstr(line, "_PASSWORD") || strstr(line, "_TOKEN") || strstr(line, "_KEY"))) {
+            add_finding(CAT_PLAINTEXT, "gitlab_ci_secret_var", CONF_LOW,
+                       path, lnum, off, line, -1,
+                       "GitLab CI secret variable reference", cb, ca);
+        }
+    }
+
     /* Kubernetes secrets (YAML format) */
     for (int i = 0; K8S_SECRET_KEYS[i]; i++) {
         const char* k8s = strcasestr_local(line, K8S_SECRET_KEYS[i]);
@@ -1739,6 +2018,16 @@ static void scan_line(const char* line, const char* path, int lnum, long off, co
                 str_lower(kvlow);
                 if (strstr(kvlow, "changeme") || strstr(kvlow, "placeholder") || strstr(kvlow, "example")) continue;
                 add_finding(CAT_TOKEN, "k8s_secret", CONF_MEDIUM, path, lnum, off, kv, -1, "Kubernetes secret", cb, ca);
+                /* Try base64 decode and surface cleartext */
+                unsigned char dec[256];
+                int dl = b64_decode(kv, vlen, dec, sizeof(dec));
+                if (dl > 4 && looks_like_text(dec, dl)) {
+                    char dv[260];
+                    snprintf(dv, sizeof(dv), "%.*s", dl, (char*)dec);
+                    add_finding(CAT_PLAINTEXT, "k8s_secret_decoded", CONF_HIGH,
+                               path, lnum, off, dv, -1,
+                               "Kubernetes secret (base64-decoded cleartext)", cb, ca);
+                }
             }
         }
     }
@@ -2008,6 +2297,20 @@ static int should_scan(const char* fn) {
         "terraform.tfvars", "variables.tf",
         "docker-compose.yml", "docker-compose.yaml",
         "values.yaml", "secrets.yaml", "secrets.yml",
+        /* Cloud-CLI specific */
+        "accessTokens.json", "azureProfile.json",
+        "credentials.db", "access_tokens.db",
+        "service-account.json", "gcloud-credentials.json",
+        /* Browser credential stores */
+        "Login Data", "Login Data For Account",
+        "Cookies", "Web Data", "Network",
+        "logins.json", "key4.db", "key3.db", "signons.sqlite",
+        "Local State",  /* Chrome encrypted_key */
+        /* CI/CD configs */
+        ".gitlab-ci.yml", ".gitlab-ci.yaml",
+        ".travis.yml", ".circleci", "bitbucket-pipelines.yml",
+        "Jenkinsfile", "azure-pipelines.yml",
+        "buildspec.yml", "cloudbuild.yaml", "cloudbuild.yml",
         /* Git */
         ".git-credentials", ".netrc",
         /* Web config */
@@ -2167,27 +2470,20 @@ static void scan_pcredz_line(const char* line, const char* path, int lnum) {
 }
 
 static void scan_file(const char* path) {
-    FILE* f = fopen(path, "rb");
-    if (!f) { result.errors++; return; }
-    
-    fseek(f, 0, SEEK_END);
-    long fsz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    
-    if (fsz > opt_max_file_size) { result.files_skipped_size++; fclose(f); return; }
-    
-    unsigned char* buf = malloc(fsz + 1);
-    if (!buf) { fclose(f); return; }
-    size_t rd = fread(buf, 1, fsz, f);
-    buf[rd] = '\0';
-    fclose(f);
-    
-    if (is_binary(buf, rd)) { result.files_skipped_binary++; free(buf); return; }
-    
+    FileBuf fb;
+    int rc = read_file(path, opt_max_file_size, &fb);
+    if (rc == -1) { ATOMIC_INC(&result.errors); return; }
+    if (rc == -2) { ATOMIC_INC(&result.files_skipped_size); return; }
+
+    unsigned char* buf = fb.data;
+    size_t rd = fb.size;
+
+    if (is_binary(buf, rd)) { ATOMIC_INC(&result.files_skipped_binary); release_file(&fb); return; }
+
     char* content; size_t clen; char* utf8 = NULL;
     if (is_utf16(buf, rd)) {
         utf8 = malloc(rd);
-        if (!utf8) { free(buf); return; }
+        if (!utf8) { release_file(&fb); return; }
         clen = utf16_to_ascii(buf, rd, utf8, rd);
         content = utf8;
     } else {
@@ -2195,31 +2491,35 @@ static void scan_file(const char* path) {
         clen = rd;
     }
     
-    result.files_scanned++;
-    
+    ATOMIC_INC(&result.files_scanned);
+
     /* Check if this is a Pcredz/Responder output file for special handling */
     int pcredz_mode = is_pcredz_output(path);
-    
-    for (int i = 0; i < 5; i++) { if (!line_buffer[i]) line_buffer[i] = malloc(MAX_LINE); if (line_buffer[i]) line_buffer[i][0]='\0'; }
-    
+
+    /* Stack-local rolling context buffer (was global — moved for thread safety) */
+    char ctx_ring[5][MAX_LINE];
+    for (int i = 0; i < 5; i++) ctx_ring[i][0] = '\0';
+    int ring_idx = 0;
+
     char* ls = content;
     int lnum = 0;
     long boff = 0;
-    
+
     while (ls < content + clen) {
         lnum++;
         char* le = ls;
         while (le < content + clen && *le != '\n' && *le != '\r') le++;
         int ll = le - ls;
         if (ll >= MAX_LINE) ll = MAX_LINE - 1;
-        
+
         char ln[MAX_LINE];
         strncpy(ln, ls, ll);
         ln[ll] = '\0';
-        
-        char* ctx_b = line_buffer[(line_buffer_idx + 4) % 5];
-        strncpy(line_buffer[line_buffer_idx], ln, MAX_LINE - 1);
-        line_buffer_idx = (line_buffer_idx + 1) % 5;
+
+        char* ctx_b = ctx_ring[(ring_idx + 4) % 5];
+        strncpy(ctx_ring[ring_idx], ln, MAX_LINE - 1);
+        ctx_ring[ring_idx][MAX_LINE - 1] = '\0';
+        ring_idx = (ring_idx + 1) % 5;
         
         char ctx_a[MAX_CONTEXT] = "";
         if (le < content + clen) {
@@ -2244,8 +2544,8 @@ static void scan_file(const char* path) {
         while (le < content + clen && (*le == '\n' || *le == '\r')) { boff++; le++; }
         ls = le;
     }
-    
-    free(buf);
+
+    release_file(&fb);
     if (utf8) free(utf8);
 }
 
@@ -2339,9 +2639,10 @@ static void scan_dir(const char* path, int depth) {
             }
 #endif
 
-            /* Normal file scan */
+            /* Normal file scan — push to queue if threading, else inline */
             if (should_scan(e->d_name)) {
-                scan_file(fp);
+                if (opt_threads > 1) queue_push(fp);
+                else scan_file(fp);
             }
         }
     }
@@ -2628,8 +2929,10 @@ static void collect_proc_environ(void) {
         count++;
 
         /* environ is NUL-delimited */
-        char buf[32768];
-        size_t rd = fread(buf, 1, sizeof(buf) - 1, f);
+        size_t buf_sz = 32768;
+        char* buf = malloc(buf_sz);
+        if (!buf) { fclose(f); continue; }
+        size_t rd = fread(buf, 1, buf_sz - 1, f);
         fclose(f);
         buf[rd] = '\0';
 
@@ -2673,6 +2976,7 @@ static void collect_proc_environ(void) {
                            envpath, 0, 0, val, -1, reason, NULL, NULL);
             }
         }
+        free(buf);
     }
     closedir(proc);
 }
@@ -3142,6 +3446,72 @@ static const char* conf_str(Confidence c) {
     switch (c) { case CONF_HIGH: return "high"; case CONF_MEDIUM: return "medium"; case CONF_LOW: return "low"; default: return "?"; }
 }
 
+/* Heuristic crackability rating based on hash type and embedded params. */
+static const char* crackability(const char* htype, const char* val) {
+    if (!htype) return "?";
+    /* Trivial: rainbow tables / no salt / weak algo */
+    if (strcmp(htype, "ntlm") == 0 || strcmp(htype, "lm") == 0) return "TRIVIAL";
+    if (strstr(htype, "md5") || strcmp(htype, "mysql5") == 0) return "TRIVIAL";
+    if (strstr(htype, "hex32_md5_ntlm")) return "TRIVIAL";
+    /* bcrypt: parse cost factor */
+    if (strstr(htype, "bcrypt") || strncmp(val, "$2", 2) == 0) {
+        int cost = 10;
+        const char* dollar2 = strchr(val + 1, '$');
+        if (dollar2 && isdigit(dollar2[1]) && isdigit(dollar2[2]))
+            cost = (dollar2[1] - '0') * 10 + (dollar2[2] - '0');
+        if (cost <= 6) return "EASY";
+        if (cost <= 10) return "MEDIUM";
+        return "HARD";
+    }
+    /* Kerberos */
+    if (strstr(htype, "krb5")) {
+        if (strstr(val, "$23$")) return "EASY";   /* RC4 */
+        if (strstr(val, "$17$") || strstr(val, "$18$")) return "HARD"; /* AES */
+        return "MEDIUM";
+    }
+    /* sha*crypt */
+    if (strstr(htype, "sha512crypt") || strstr(htype, "sha256crypt")) return "MEDIUM";
+    /* Argon2 / scrypt / yescrypt - memory-hard */
+    if (strstr(htype, "argon2") || strstr(htype, "scrypt") || strstr(htype, "yescrypt")) return "HARD";
+    /* NetNTLM */
+    if (strstr(htype, "netntlmv1")) return "EASY";
+    if (strstr(htype, "netntlmv2")) return "MEDIUM";
+    /* GPP cpassword: AES key is public — instant decrypt */
+    if (strstr(htype, "gpp_cpassword")) return "INSTANT";
+    return "?";
+}
+
+/* MITRE ATT&CK technique mapping. Returns NULL if no specific mapping. */
+static const char* mitre_attack(Category cat, const char* htype) {
+    if (!htype) return NULL;
+    /* T1003 Credential Dumping family */
+    if (cat == CAT_PASSWORD_HASH) {
+        if (strstr(htype, "ntlm") || strstr(htype, "lm") || strstr(htype, "pwdump")) return "T1003.002";  /* SAM */
+        if (strstr(htype, "krb5")) return "T1558";  /* Kerberoasting / AS-REP roast */
+        if (strstr(htype, "shadow") || strstr(htype, "sha512crypt") || strstr(htype, "sha256crypt") ||
+            strstr(htype, "md5crypt") || strstr(htype, "yescrypt")) return "T1003.008";  /* /etc/shadow */
+        if (strstr(htype, "dcc")) return "T1003.005";  /* Cached domain creds */
+        return "T1003";
+    }
+    if (cat == CAT_NETWORK_AUTH) {
+        if (strstr(htype, "netntlm") || strstr(htype, "smb")) return "T1557.001";  /* LLMNR/NBT-NS poisoning */
+        if (strstr(htype, "wpa") || strstr(htype, "wifi")) return "T1040";  /* Network sniffing */
+        return "T1557";
+    }
+    if (cat == CAT_PLAINTEXT) {
+        if (strstr(htype, "gpp_cpassword")) return "T1552.006";  /* Group Policy Prefs */
+        if (strstr(htype, "history") || strstr(htype, "process_env")) return "T1552.003";  /* Bash history / env */
+        if (strstr(htype, "wifi_psk") || strstr(htype, "k8s_secret")) return "T1552.001";  /* Creds in files */
+        return "T1552";  /* Unsecured Credentials */
+    }
+    if (cat == CAT_TOKEN) {
+        if (strstr(htype, "aws") || strstr(htype, "azure") || strstr(htype, "gcloud")) return "T1552.005";  /* Cloud Instance Metadata */
+        return "T1552.001";
+    }
+    if (cat == CAT_PRIVATE_KEY) return "T1552.004";  /* Private Keys */
+    return NULL;
+}
+
 static void print_report(void) {
     double dur = difftime(time(NULL), result.start_time);
     printf("\n══════════════════════════════════════════════════════════════════════\n");
@@ -3176,6 +3546,8 @@ static void print_report(void) {
             printf("      Value  : %s (len:%d)\n", f->value_preview, f->value_length);
             if (f->occurrence_count > 1) printf("      Seen   : %d times\n", f->occurrence_count);
             if (f->hashcat_mode >= 0) printf("      Hashcat: -m %d\n", f->hashcat_mode);
+            const char* att = mitre_attack(f->category, f->hash_type);
+            if (att) printf("      MITRE  : %s\n", att);
             if (f->context_before[0] && opt_context_lines) printf("      Context: ...%s\n              > [MATCH]\n", f->context_before);
         }
         printf("\n");
@@ -3255,16 +3627,37 @@ static void print_report(void) {
                 modes_seen[f->hashcat_mode] = 1;
                 
                 const char* mode_name = f->hash_type;
-                printf("  # %s (mode %d)\n", mode_name, f->hashcat_mode);
+                const char* crack = crackability(f->hash_type, f->value_full);
+                printf("  # %s (mode %d) [crackability: %s]\n", mode_name, f->hashcat_mode, crack);
                 printf("  hashcat -m %d -a 0 hashes_%s.txt wordlist.txt\n", f->hashcat_mode, f->hash_type);
-                
-                /* Print hashes for this mode */
-                printf("  # Hashes:\n");
-                for (int j = 0; j < result.count; j++) {
-                    if (result.findings[j].hashcat_mode == f->hashcat_mode) {
-                        printf("  # echo '%s' >> hashes_%s.txt\n", 
-                               opt_show_values ? result.findings[j].value_full : result.findings[j].value_preview,
-                               f->hash_type);
+
+                /* Write hash file directly (cwd) when --show-values is set, else hint */
+                int written = 0;
+                if (opt_show_values) {
+                    char hf_name[256];
+                    snprintf(hf_name, sizeof(hf_name), "hashes_%s.txt", f->hash_type);
+                    /* Sanitize filename — strip slashes/spaces */
+                    for (char* c = hf_name; *c; c++)
+                        if (*c == '/' || *c == '\\' || *c == ' ') *c = '_';
+                    FILE* hf = fopen(hf_name, "w");
+                    if (hf) {
+                        for (int j = 0; j < result.count; j++) {
+                            if (result.findings[j].hashcat_mode == f->hashcat_mode) {
+                                fprintf(hf, "%s\n", result.findings[j].value_full);
+                                written++;
+                            }
+                        }
+                        fclose(hf);
+                        printf("  # → wrote %d hashes to %s\n", written, hf_name);
+                    }
+                }
+                if (!written) {
+                    printf("  # Hashes (use --show-values to auto-write hashes_*.txt):\n");
+                    for (int j = 0; j < result.count; j++) {
+                        if (result.findings[j].hashcat_mode == f->hashcat_mode) {
+                            printf("  # %s\n",
+                                   opt_show_values ? result.findings[j].value_full : result.findings[j].value_preview);
+                        }
                     }
                 }
                 printf("\n");
@@ -3336,6 +3729,9 @@ static void print_json(void) {
         fprintf(out, "    {\"category\":\"%s\",\"hash_type\":\"%s\",\"confidence\":\"%s\",", cat_str(f->category), eht, conf_str(f->confidence));
         fprintf(out, "\"file_path\":\"%s\",\"line\":%d,\"value\":\"%s\",\"len\":%d,", ep, f->line_number, ev, f->value_length);
         fprintf(out, "\"occurrences\":%d,\"hashcat\":%d,\"owner\":\"%s\",\"reason\":\"%s\",", f->occurrence_count, f->hashcat_mode, eo, er);
+        const char* att = mitre_attack(f->category, f->hash_type);
+        const char* crk = crackability(f->hash_type, f->value_full);
+        fprintf(out, "\"mitre\":\"%s\",\"crackability\":\"%s\",", att ? att : "", crk);
         fprintf(out, "\"context_before\":\"%s\",\"context_after\":\"%s\"}", ecb, eca);
         fprintf(out, "%s\n", i < result.count - 1 ? "," : "");
     }
@@ -3378,7 +3774,6 @@ static void run_profile(const char* p) {
         if (up) { if (opt_verbose) fprintf(stderr, "[*] %s\n", up); scan_dir(up, 0); }
         /* Windows-specific paths */
         char* appdata = getenv("APPDATA");
-        char* programdata = getenv("ProgramData");
         if (appdata) scan_dir(appdata, 0);
         /* IIS config */
         { struct stat st; if (stat("C:\\Windows\\System32\\inetsrv\\config", &st) == 0) scan_dir("C:\\Windows\\System32\\inetsrv\\config", 0); }
@@ -3396,6 +3791,24 @@ static void run_profile(const char* p) {
         scan_dir("/root/.aws", 0);
         scan_dir("/root/.kube", 0);
         scan_dir("/root/.docker", 0);
+        scan_dir("/root/.azure", 0);
+        scan_dir("/root/.config/gcloud", 0);
+        if (h) {
+            char hp[MAX_PATH_LEN];
+            const char* extra[] = {".aws", ".kube", ".docker", ".azure",
+                                   ".config/gcloud", ".github/workflows",
+                                   ".gitlab",
+                                   /* Browser credential stores */
+                                   ".config/google-chrome/Default",
+                                   ".config/chromium/Default",
+                                   ".mozilla/firefox",
+                                   ".config/BraveSoftware/Brave-Browser/Default",
+                                   NULL};
+            for (int i = 0; extra[i]; i++) {
+                snprintf(hp, sizeof(hp), "%s/%s", h, extra[i]);
+                struct stat st; if (stat(hp, &st) == 0) scan_dir(hp, 0);
+            }
+        }
 #endif
     }
 
@@ -3654,6 +4067,7 @@ static void usage(const char* p) {
     printf("  -q, --quiet       Suppress banner and status output\n");
     printf("  --max-files <n>   Max files (default: 50000)\n");
     printf("  --timeout <s>     Max runtime seconds\n");
+    printf("  --threads <n>     Worker threads for file scanning (default: 1, max: 64)\n");
     printf("  --no-collectors   Disable archive/sqlite/git collectors\n");
     printf("\nIntelligence:\n");
     printf("  --hashcat         Generate hashcat commands\n");
@@ -3694,7 +4108,6 @@ int main(int argc, char* argv[]) {
     result.findings = malloc(result.capacity * sizeof(Finding));
     if (!result.findings) { fprintf(stderr, "Error: Out of memory\n"); return 1; }
     init_tables();
-    for (int i = 0; i < 5; i++) { line_buffer[i] = malloc(MAX_LINE); if (line_buffer[i]) line_buffer[i][0] = '\0'; }
     
     const char* profile = NULL;
     const char* outfile = NULL;
@@ -3718,6 +4131,11 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i],"--max-files")==0&&i+1<argc) opt_max_files=atoi(argv[++i]);
         else if (strcmp(argv[i],"--timeout")==0&&i+1<argc) opt_max_runtime=atoi(argv[++i]);
         else if (strcmp(argv[i],"--context")==0&&i+1<argc) opt_context_lines=atoi(argv[++i]);
+        else if (strcmp(argv[i],"--threads")==0&&i+1<argc) {
+            opt_threads = atoi(argv[++i]);
+            if (opt_threads < 1) opt_threads = 1;
+            if (opt_threads > 64) opt_threads = 64;
+        }
         else if (argv[i][0]!='-'&&pathc<100) paths[pathc++]=argv[i];
     }
     
@@ -3741,17 +4159,43 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "[*] Mode: %s | Context: %d | Max: %d files\n", opt_wide?"wide":"strict", opt_context_lines, opt_max_files);
         if (profile) fprintf(stderr, "[*] Profile: %s\n", profile);
         if (opt_pcredz_file) fprintf(stderr, "[*] Pcredz mode: %s\n", opt_pcredz_file);
+        if (opt_threads > 1) fprintf(stderr, "[*] Threads: %d\n", opt_threads);
         fprintf(stderr, "\n");
+    }
+
+    /* Initialize threading locks if needed (always — add_finding checks g_locks_init) */
+    init_locks();
+
+    /* Spawn worker threads if threading enabled */
+    thread_t* workers = NULL;
+    if (opt_threads > 1) {
+        workers = malloc(opt_threads * sizeof(thread_t));
+        if (workers) {
+            for (int i = 0; i < opt_threads; i++) {
+                if (thread_create(&workers[i], worker_thread, NULL) != 0) {
+                    fprintf(stderr, "[!] Failed to spawn worker %d\n", i);
+                    opt_threads = i;
+                    break;
+                }
+            }
+        } else {
+            opt_threads = 1;
+        }
     }
     
     /* Pcredz direct parsing mode - skip normal scanning */
     if (opt_pcredz_file) {
         parse_pcredz_file(opt_pcredz_file);
+        /* Drain workers (none queued, just close + join) */
+        if (opt_threads > 1 && workers) {
+            queue_close();
+            for (int i = 0; i < opt_threads; i++) thread_join(workers[i]);
+            free(workers);
+        }
         if (opt_json) print_json(); else print_report();
         if (json_file) { fclose(json_file); fprintf(stderr, "\n[+] Saved: %s\n", outfile); }
         free(result.findings);
         free_tables();
-        for (int i = 0; i < 5; i++) if (line_buffer[i]) free(line_buffer[i]);
         return 0;
     }
     
@@ -3797,12 +4241,18 @@ int main(int argc, char* argv[]) {
         char* h = getenv("HOME"); if (h) { if (!opt_quiet) fprintf(stderr, "[*] %s\n", h); scan_dir(h, 0); }
 #endif
     }
-    
+
+    /* Drain queue and join worker threads */
+    if (opt_threads > 1 && workers) {
+        queue_close();
+        for (int i = 0; i < opt_threads; i++) thread_join(workers[i]);
+        free(workers);
+    }
+
     if (opt_json) print_json(); else print_report();
     if (json_file) { fclose(json_file); fprintf(stderr, "\n[+] Saved: %s\n", outfile); }
-    
+
     free(result.findings);
     free_tables();
-    for (int i = 0; i < 5; i++) if (line_buffer[i]) free(line_buffer[i]);
     return 0;
 }

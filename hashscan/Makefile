@@ -1,11 +1,12 @@
 # ============================================================================
-# HASHSCAN v11.0 - Makefile
+# HASHSCAN v11.2 - Makefile
 # ============================================================================
 
 CC       = gcc
 MINGW    = x86_64-w64-mingw32-gcc
 CFLAGS   = -O2 -Wall -Wextra
-LDFLAGS  = -lm
+LDFLAGS  = -lm -lpthread
+LDFLAGS_WIN = -lm
 SRC      = hashscan.c
 BIN      = hashscan
 BIN_WIN  = hashscan.exe
@@ -34,7 +35,7 @@ $(BIN): $(SRC)
 
 $(BIN_WIN): $(SRC)
 	@if command -v $(MINGW) >/dev/null 2>&1; then \
-		$(MINGW) $(CFLAGS) -o $@ $< $(LDFLAGS); \
+		$(MINGW) $(CFLAGS) -o $@ $< $(LDFLAGS_WIN); \
 		echo "[+] Built: $@ ($(shell stat -c%s $@ 2>/dev/null || echo '?') bytes)"; \
 	else \
 		echo "[-] mingw-w64 not installed, skipping Windows build"; \
